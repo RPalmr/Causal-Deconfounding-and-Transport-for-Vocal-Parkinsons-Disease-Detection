@@ -4,4 +4,5 @@ data/
 material/
 notes/
 *.txt
-tCB/.DS_Store
+tCB/
+.DS_Store
