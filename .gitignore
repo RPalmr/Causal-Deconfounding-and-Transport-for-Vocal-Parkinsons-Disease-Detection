@@ -1,0 +1,7 @@
+__pycache__/
+libraries/
+data/
+material/
+notes/
+*.txt
+tCB/.DS_Store
