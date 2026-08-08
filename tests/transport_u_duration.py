@@ -1,249 +1,344 @@
-"""
-Transportable Causal Bootstrapping with U = disease duration (NeuroVoz -> ParkCeleb).
-
-    Duration -> PD;  Duration -> Voice;  PD -> Voice;
-    Pause    -> Voice;  S_dur -> Duration;  S_pause -> Pause
-
-U (source): "Time Disease (years)" from metadata_pd.csv (0 for HC).
-U (target): years_from_diagnosis x sign(before/after) from speakers_info.csv (0 for CN).
-
-    w ~ P*(Duration, Pause) / P(Duration, Pause | PD)
-"""
-
-import sys, os, warnings
+import sys, os
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.decomposition import PCA
-from scipy.stats import gaussian_kde
-
-warnings.filterwarnings("ignore")
+import openpyxl
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA = f"{BASE}/data"
-for p in [f"{BASE}/libraries/GRAPL", f"{BASE}/libraries/CausalBootstrapping",
-          f"{BASE}/tCB", BASE]:
+for p in [f"{BASE}/libraries/CausalBootstrapping", f"{BASE}/libraries/GRAPL",
+          f"{BASE}/libraries/causal_assistant", f"{BASE}/tCB", f"{BASE}/tests"]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from sID_expr import sid
-import grapl.dsl as dsl
-from causalBootstrapping import bootstrapper
+import causal_assistant as ca
 
-TEST_SIZE = 0.2
+from sklearn.ensemble import GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.metrics import roc_auc_score, f1_score
+
+import transport_u_age as age
+import transport_u_duration as dur
+
 RANDOM_SEED = 42
-N_RUNS = 500
-N_TILE = 10
+N_BOOT = 200
+AGE_EDGES = np.arange(40, 101, 10)
+META_COLS = {"Unnamed: 0", "tot_name"}
+INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}
+NV_FEAT = f"{BASE}/data/neurovoz/extracted_features"
+N_SELECT = 30
+UPDRS_EDGES = [0, 10, 20, 40, 70, 200]
+GRBAS_EDGES = [0, 1, 2, 3, 4]
+GBM_GRID = {"n_estimators": [100, 200], "max_depth": [3, 5],
+            "learning_rate": [0.05, 0.1]}
+CB_FIT_METHOD = "kde"
 
+UGAS_GRAPH = "y;X;Age;Sex;UPDRS;GRBAS; y<->X; y->UPDRS; UPDRS->X; y->GRBAS; GRBAS->X; Age->X; Age->y; Sex->X; Sex->y;"
 
-def _stem(x):
-    s = os.path.basename(str(x))
-    while s.endswith(".wav"):
-        s = s[:-4]
-    return s.replace("audios-", "").replace("audios/", "")
-
-
-def _nv_duration_by_patient():
-    hc = pd.read_csv(f"{DATA}/neurovoz/metadata/metadata_hc.csv")
-    pd_ = pd.read_csv(f"{DATA}/neurovoz/metadata/metadata_pd.csv")
+def load_nv_petaca():
+    hc = pd.read_csv(f"{BASE}/data/neurovoz/metadata/metadata_hc.csv")
+    pd_ = pd.read_csv(f"{BASE}/data/neurovoz/metadata/metadata_pd.csv")
     mt = pd.concat([hc, pd_], ignore_index=True)
     mt["_pid"] = mt["ID"].map(lambda i: f"{int(i):04d}")
-    mt["Time Disease (years)"] = pd.to_numeric(mt["Time Disease (years)"], errors="coerce")
-    dur = mt.groupby("_pid")["Time Disease (years)"].median()
-    return dur.where(dur.notna(), 0.0).to_dict()
+    mt["Age"] = pd.to_numeric(mt["Age"], errors="coerce")
+    mt["Sex"] = pd.to_numeric(mt["Sex"], errors="coerce")
+    mt["UPDRS scale"] = pd.to_numeric(mt["UPDRS scale"], errors="coerce")
+    a_by_pid = mt.groupby("_pid")["Age"].median()
+    s_by_pid = mt.groupby("_pid")["Sex"].median()
+    u_by_pid = mt.groupby("_pid")["UPDRS scale"].median()
 
+    grbas = {}
+    for f in os.listdir(f"{BASE}/data/grbas"):
+        if not f.endswith(".csv"):
+            continue
+        for _, r in pd.read_csv(f"{BASE}/data/grbas/{f}").iterrows():
+            gid = os.path.splitext(os.path.basename(str(r["text_patient_id"])))[0].strip()
+            try:
+                grbas[gid] = float(r["G"])
+            except (ValueError, TypeError):
+                pass
 
-def _sl(df, kv, common, meta_cols):
-    return (df.loc[kv.isin(common)].loc[:, ~df.columns.isin(meta_cols)]
-            .set_index(kv[kv.isin(common)].values))
-
-
-def load_neurovoz():
-    base = f"{DATA}/neurovoz/extracted_features"
-    intens = pd.read_csv(f"{base}/intensity_features_neurovoz.csv")
-    pause = pd.read_csv(f"{base}/pause_features_neurovoz.csv")
-    syll = pd.read_csv(f"{base}/syllable_features_neurovoz.csv")
-    meta_cols = {"Unnamed: 0", "tot_name"}
-    ki, kp, ks = intens["tot_name"].apply(_stem), pause["tot_name"].apply(_stem), syll["tot_name"].apply(_stem)
+    intens = pd.read_csv(f"{NV_FEAT}/intensity_features_neurovoz.csv")
+    pause = pd.read_csv(f"{NV_FEAT}/pause_features_neurovoz.csv")
+    syll = pd.read_csv(f"{NV_FEAT}/syllable_features_neurovoz.csv")
+    def stem(x):
+        s = os.path.basename(str(x))
+        while s.endswith(".wav"):
+            s = s[:-4]
+        return s.replace("audios-", "").replace("audios/", "")
+    ki, kp, ks = (intens["tot_name"].apply(stem),
+                  pause["tot_name"].apply(stem),
+                  syll["tot_name"].apply(stem))
     common = sorted(set(ki) & set(kp) & set(ks))
-    X = pd.concat([_sl(intens, ki, common, meta_cols), _sl(pause, kp, common, meta_cols),
-                   _sl(syll, ks, common, meta_cols)], axis=1).values.astype(np.float64)
-    Y = np.array([1 if s.startswith("PD_") else 0 for s in common], dtype=np.float64)
-    dur = _nv_duration_by_patient()
-    U = np.array([dur.get(s[-4:], np.nan) for s in common], dtype=np.float64)
-    P = np.nanmedian(_sl(pause, kp, common, meta_cols).select_dtypes(include=[np.number]).values, axis=1)
-    ok = ~(np.isnan(X).any(axis=1) | np.isnan(U))
-    return X[ok], Y[ok], U[ok], P[ok]
+    common = [c for c in common if "PETACA" in c]
+    X = pd.concat([dur._sl(intens, ki, common, META_COLS),
+                   dur._sl(pause, kp, common, META_COLS),
+                   dur._sl(syll, ks, common, META_COLS)], axis=1)
+    X = X.values.astype(np.float64)
+    Y = np.array([1 if c.startswith("PD_") else 0 for c in common], dtype=np.float64)
+    pid = np.array([c[-4:] for c in common])
+    ag = np.array([a_by_pid.get(p, np.nan) for p in pid], dtype=np.float64)
+    sx = np.array([s_by_pid.get(p, np.nan) for p in pid], dtype=np.float64)
+    up = np.array([u_by_pid.get(p, 0.0) if not np.isnan(u_by_pid.get(p, np.nan)) else 0.0
+                   for p in pid], dtype=np.float64)
+    up = np.where(np.isnan(up), 0.0, up)
+    gr = np.array([grbas.get(c[3:], np.nan) for c in common], dtype=np.float64)
+    ok = ~(np.isnan(X).any(axis=1) | np.isnan(ag) | np.isnan(sx) | np.isnan(gr))
+    return X[ok], Y[ok], ag[ok], sx[ok], up[ok], gr[ok], pid[ok]
 
-
-def load_parkceleb():
-    base = f"{DATA}/parkceleb_extracted"
+def load_pc_intervals():
+    base = f"{BASE}/data/parkceleb_extracted"
     intens = pd.read_csv(f"{base}/intensity_features_parkceleb.csv")
     pause = pd.read_csv(f"{base}/pause_features_parkceleb.csv")
     syll = pd.read_csv(f"{base}/syllable_features_parkceleb.csv")
-    meta = {"parkceleb_group", "parkceleb_label", "speaker_id", "video_id",
-            "diarization_speaker", "source_type", "audio_file", "audio_ext", "audio_path",
-            "intensity_ok", "intensity_error", "pause_ok", "pause_error",
-            "syllable_ok", "syllable_error", "tot_name"}
-    X = pd.concat([intens.loc[:, ~intens.columns.isin(meta)],
-                   pause.loc[:, ~pause.columns.isin(meta)],
-                   syll.loc[:, ~syll.columns.isin(meta)]], axis=1).values.astype(np.float64)
-
-    vid_dur = {}
-    for group in ("CN", "PD"):
-        gp = f"{DATA}/ParkCeleb/{group}"
-        if not os.path.isdir(gp):
-            continue
-        for pdir in os.listdir(gp):
-            ppath = f"{gp}/{pdir}"
-            if not os.path.isdir(ppath):
-                continue
-            for vdir in os.listdir(ppath):
-                si = f"{ppath}/{vdir}/speakers_info.csv"
-                if not os.path.isfile(si):
-                    continue
-                try:
-                    info = pd.read_csv(si)
-                    tgt = info[info["status"] == "target"]
-                    if tgt.empty:
-                        continue
-                    row = tgt.iloc[0]
-                    yfd = str(row["years_from_diagnosis"]).strip()
-                    if group == "CN" or yfd in ("", "same", "nan"):
-                        vid_dur[vdir] = 0.0
-                    else:
-                        sign = 1 if str(row["before_after_diagnosis"]).strip().lower() == "after" else -1
-                        vid_dur[vdir] = float(sign * float(yfd))
-                except Exception:
-                    vid_dur[vdir] = 0.0
-
-    U = np.array([vid_dur.get(v, np.nan) for v in intens["video_id"].astype(str).values], dtype=np.float64)
+    kid = intens["audio_file"].map(
+        lambda f: (lambda m: m.group(1) if m else np.nan)(
+            age.IDRE.search(str(f))))
+    m = kid.notna()
+    intens, pause, syll, kid = (intens[m].reset_index(drop=True),
+                                pause[m].reset_index(drop=True),
+                                syll[m].reset_index(drop=True),
+                                kid[m].reset_index(drop=True))
+    X = pd.concat([intens.loc[:, ~intens.columns.isin(age.FEATURE_META)],
+                   pause.loc[:, ~pause.columns.isin(age.FEATURE_META)],
+                   syll.loc[:, ~syll.columns.isin(age.FEATURE_META)]], axis=1)
+    X = X.values.astype(np.float64)
     Y = intens["parkceleb_label"].values.astype(np.float64)
-    P = np.nanmedian(pause.loc[:, ~pause.columns.isin(meta)].select_dtypes(include=[np.number]).values, axis=1)
     sid = intens["speaker_id"].astype(str).values
-    ok = ~(np.isnan(X).any(axis=1) | np.isnan(U))
-    return X[ok], Y[ok], U[ok], P[ok], sid[ok]
 
+    ages_csv = pd.read_csv(f"{BASE}/data/parkceleb_ages.csv")
+    age_by_af = (ages_csv.drop_duplicates("audio_file")
+                 .set_index("audio_file")["age"])
+    af_key = intens["audio_file"].astype(str).map(
+        lambda f: f if f in age_by_af.index else np.nan)
+    t_age_all = af_key.map(age_by_af).values.astype(np.float64)
 
-def build_causal_graph():
-    return dsl.GraplDSL().readgrapl(
-        "Duration; PD; Voice; Pause; S_dur; S_pause;"
-        "Duration -> PD; Duration -> Voice; PD -> Voice; Pause -> Voice;"
-        "S_dur -> Duration; S_pause -> Pause;"
-    )
+    def _demo_gender(path, ncols):
+        wb = openpyxl.load_workbook(f"{BASE}/{path}", read_only=True)
+        rows = list(wb.active.iter_rows(values_only=True))
+        hdr = [str(c).strip().lower().replace(" ", "") for c in rows[0]]
+        gi = hdr.index("gender")
+        out = {}
+        for r in rows[2:]:
+            if r[0] is None:
+                continue
+            out[str(r[0]).strip()] = (1.0 if str(r[gi]).strip().lower()
+                                      .startswith("m") else 0.0)
+        return out
+    gender = {}
+    gender.update(_demo_gender("data/ParkCeleb/PD_demo.xlsx", 5))
+    gender.update(_demo_gender("data/ParkCeleb/CN_demo.xlsx", 4))
+    t_sex_all = np.array([gender.get(s, np.nan) for s in sid],
+                         dtype=np.float64)
 
+    upload = pd.read_csv(f"{BASE}/data/parkceleb_upload_years.csv")
+    upload["video_id"] = upload["video_id"].astype(str)
+    up_full = upload["upload_date"].astype(str).str[:4]
+    up = up_full[up_full.str.fullmatch(r"\d{4}")].astype(int)
+    up.index = upload.loc[up.index, "video_id"]
 
-def compute_transport_weights(y_src, dur_src, pause_src, dur_trg, pause_trg):
-    n = len(y_src)
-    nv_dp = np.column_stack([dur_src.ravel(), pause_src.ravel()])
-    kde_dp_given_pd = {}
-    for pd_val in (0, 1):
-        dp = nv_dp[y_src.ravel() == pd_val]
-        if dp.shape[0] > 3:
-            if np.var(dp[:, 0]) < 1e-9:
-                rng = np.random.RandomState(0)
-                dp = dp.copy()
-                dp[:, 0] += rng.normal(0.0, 0.25, dp.shape[0])
-            kde_dp_given_pd[pd_val] = gaussian_kde(dp.T)
+    wb = openpyxl.load_workbook(f"{BASE}/data/ParkCeleb/PD_demo.xlsx",
+                                read_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    hdr = [str(c).strip().lower().replace(" ", "") for c in rows[0]]
+    yod = {}
+    for r in rows[2:]:
+        if r[0] is None:
+            continue
+        sp = str(r[0]).strip()
+        yod[sp] = int(str(r[hdr.index("yod")]).strip())
+    wb2 = openpyxl.load_workbook(f"{BASE}/data/ParkCeleb/speakers_pairs.xlsx",
+                                 read_only=True)
+    ws2 = wb2.active
+    rows2 = list(ws2.iter_rows(values_only=True))
+    pairs = {}
+    for r in rows2[1:]:
+        if r[0] is None:
+            continue
+        pairs[str(r[0]).strip()] = str(r[1]).strip()
+
+    iv = np.full(len(X), np.nan)
+    for i, sp in enumerate(sid):
+        vid = kid[i]
+        if vid not in up.index:
+            continue
+        uy = up[vid]
+        if sp.startswith("pd_"):
+            yr = yod.get(sp)
         else:
-            kde_dp_given_pd[pd_val] = None
-    kde_target_dur = gaussian_kde(dur_trg)
-    kde_target_pause = gaussian_kde(pause_trg)
-    log_floor = np.log(1e-12)
-    log_target = np.maximum(
-        kde_target_dur.logpdf(dur_src.reshape(1, -1))
-        + kde_target_pause.logpdf(pause_src.reshape(1, -1)),
-        log_floor,
+            yr = yod.get(pairs.get(sp))
+        if yr is None:
+            continue
+        iv[i] = uy - yr
+
+    out = {}
+    for name, (lo, hi) in INTERVALS.items():
+        sel = (iv >= lo) & (iv <= hi)
+        out[name] = (X[sel], Y[sel], sid[sel], t_age_all[sel], t_sex_all[sel])
+    return out
+
+def gbm(**kw):
+    return GradientBoostingClassifier(**kw)
+
+def select_features(Xs, ys, seed):
+    et = ExtraTreesClassifier(n_estimators=200, max_depth=10,
+                              random_state=seed, n_jobs=-1).fit(Xs, ys)
+    cols = np.argsort(et.feature_importances_)[::-1][:N_SELECT]
+    return cols
+
+def bin1(v, edges):
+    return np.clip(np.searchsorted(edges, v, side="right") - 1,
+                   0, len(edges) - 2)
+
+def exact_pmf(names, vals, laplace=0.0):
+    vals2 = vals.reshape(-1, len(names))
+    K = vals2.shape[0]
+    ncells = 1
+    for n in names:
+        ncells *= np.unique(vals2[:, names.index(n)]).size
+    def _core(*args):
+        arrs = [np.atleast_1d(a).reshape(-1) for a in args]
+        Xm = np.column_stack(arrs)
+        raw = np.array([np.mean((vals2 == row[None, :]).all(axis=1))
+                        for row in Xm])
+        return (raw * K + laplace) / (K + laplace * ncells)
+    ns = {"_core": _core}
+    exec(f"_pdf = lambda {','.join(names)}: _core({','.join(names)})", ns)
+    return ns["_pdf"]
+
+def source_cb_weights(Xsf, ys, ag, sx, up, gr):
+
+    w = ca.causal_weights(
+        causal_graph=UGAS_GRAPH, cause_var="y", effect_var="X",
+        fit_method=CB_FIT_METHOD,
+        X=Xsf,
+        y=ys,
+        Age=(ag, len(AGE_EDGES) - 1),
+        Sex=sx,
+        UPDRS=(up, len(UPDRS_EDGES) - 1),
+        GRBAS=(gr, len(GRBAS_EDGES) - 1),
     )
-    weights = np.zeros((n, 2))
-    for intv_pd in (0, 1):
-        k = kde_dp_given_pd.get(intv_pd)
-        log_source = np.full(n, log_floor) if k is None else k.logpdf(nv_dp.T)
-        weights[:, intv_pd] = np.exp(log_target - np.maximum(log_source, log_floor)) + 1e-10
-    return weights
+    w = np.asarray(w)
+    uy = np.unique(ys)
+    col = {v: i for i, v in enumerate(uy)}
+    return np.array([w[i, col[ys[i]]] for i in range(len(ys))])
 
+def transport_ratio(ag, sx, t_age, t_sex):
+    a_src = bin1(ag, AGE_EDGES).astype(float)
+    a_tgt = bin1(t_age, AGE_EDGES).astype(float)
+    s_src = sx.astype(float)
+    s_tgt = np.round(np.asarray(t_sex, dtype=float))
 
-def balanced_acc(y_true, proba, threshold=0.5):
-    y_pred = (proba >= threshold).astype(int)
-    tp, fn = ((y_pred == 1) & (y_true == 1)).sum(), ((y_pred == 0) & (y_true == 1)).sum()
-    tn, fp = ((y_pred == 0) & (y_true == 0)).sum(), ((y_pred == 1) & (y_true == 0)).sum()
-    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    return 0.5 * (sens + spec)
+    t_ok = ~(np.isnan(a_tgt) | np.isnan(s_tgt))
+    p_tgt = exact_pmf(["Age", "Sex"],
+                       np.column_stack([a_tgt[t_ok], s_tgt[t_ok]]),
+                       laplace=0.5)
+    p_src = exact_pmf(["Age", "Sex"],
+                       np.column_stack([a_src, s_src]),
+                       laplace=0.5)
+    num = p_tgt(a_src, s_src)
+    den = p_src(a_src, s_src)
+    return num / den
 
+def ugas_weights(Xsf, ys, ag, sx, up, gr, t_age, t_sex):
+    w_source = source_cb_weights(Xsf, ys, ag, sx, up, gr)
+    r = transport_ratio(ag, sx, t_age, t_sex)
+    return w_source * r
 
-def patient_level_metrics(y, proba, patient_ids):
-    pdf = pd.DataFrame({"y": y.ravel(), "proba": proba.ravel(),
-                        "patient": np.asarray(patient_ids)}).groupby("patient").mean()
-    return balanced_acc(pdf["y"].values, pdf["proba"].values)
-
-
-def fit_logit(X, y):
+def patient_metrics(y, proba, pids):
+    del pids
     y = np.asarray(y).ravel()
-    X = np.asarray(X, dtype=float)
-    med = np.nanmedian(X, axis=0)
-    col_med = np.where(np.isnan(med), 0.0, med)
-    X = np.where(np.isnan(X), col_med, X)
-    keep = np.var(X, axis=0) > 0
-    return {"model": LogisticRegression(penalty="l1", solver="liblinear", C=1.0,
-                                        max_iter=1000, random_state=0).fit(X[:, keep], y),
-            "col_med": col_med[keep], "keep": keep, "n_full": len(keep)}
+    p = np.asarray(proba).ravel()
+    ba = dur.balanced_acc(y, p)
+    f1 = f1_score(y, p > 0.5, zero_division=0)
+    auc = roc_auc_score(y, p) if len(np.unique(y)) > 1 else np.nan
+    return ba, f1, auc
 
+def grid_search(Xs, ys, pids, seed=0):
+    from sklearn.model_selection import GroupKFold
+    uniq = np.unique(pids)
+    rng = np.random.RandomState(seed)
+    best, best_s = None, -np.inf
+    for ne in GBM_GRID["n_estimators"]:
+        for md in GBM_GRID["max_depth"]:
+            for lr in GBM_GRID["learning_rate"]:
+                scores = []
+                for rep in range(3):
+                    order = rng.permutation(uniq)
+                    folds = np.array_split(order, 5)
+                    for fi in range(5):
+                        tr_p = np.concatenate([f for j, f in enumerate(folds)
+                                               if j != fi])
+                        te_p = folds[fi]
+                        tr = np.isin(pids, tr_p)
+                        te = np.isin(pids, te_p)
+                        m = GradientBoostingClassifier(
+                            n_estimators=ne, max_depth=md, learning_rate=lr,
+                            random_state=seed).fit(Xs[tr], ys[tr])
+                        scores.append(roc_auc_score(ys[te], m.predict_proba(
+                            Xs[te])[:, 1]))
+                sc = np.mean(scores)
+                if sc > best_s:
+                    best_s, best = sc, {"n_estimators": ne, "max_depth": md,
+                                        "learning_rate": lr}
+    return best
 
-def predict_logit(model, X):
-    X = np.asarray(X, dtype=float)
-    if X.shape[1] != model["n_full"] or not model["keep"].all():
-        X = X[:, model["keep"]]
-    return model["model"].predict_proba(np.where(np.isnan(X), model["col_med"], X))[:, 1]
+def run_interval(name, Xs, ys, ag, sx, up, gr, pids, Xt, yt, sidt, t_age, t_sex):
+    hp = grid_search(Xs, ys, pids, seed=RANDOM_SEED)
+    print(f"    grid-search best params on source: {hp}")
 
+    rng = np.random.RandomState(RANDOM_SEED)
+    conf_ba, conf_f1, conf_auc = [], [], []
+    dec_ba, dec_f1, dec_auc = [], [], []
+    ess_runs = []
+    for r in range(N_BOOT):
+        seed = rng.randint(0, 2**31 - 1)
+        cols = select_features(Xs, ys, seed)
+        Xsf, Xtf = Xs[:, cols], Xt[:, cols]
+
+        mod_conf = gbm(random_state=seed, **hp).fit(Xsf, ys)
+        w = ugas_weights(Xsf, ys, ag, sx, up, gr, t_age, t_sex)
+        ess_runs.append((w.sum() ** 2) / (w ** 2).sum())
+        lo, hi = np.percentile(w, 5), np.percentile(w, 95)
+        mod_deconf = gbm(random_state=seed + 1, **hp).fit(
+            Xsf, ys, sample_weight=np.clip(w, lo, hi))
+
+        p_conf = mod_conf.predict_proba(Xtf)[:, 1]
+        p_deconf = mod_deconf.predict_proba(Xtf)[:, 1]
+        cba, cf1, cauc = patient_metrics(yt, p_conf, sidt)
+        dba, df1, dauc = patient_metrics(yt, p_deconf, sidt)
+        conf_ba.append(cba); conf_f1.append(cf1); conf_auc.append(cauc)
+        dec_ba.append(dba); dec_f1.append(df1); dec_auc.append(dauc)
+
+    return {"BA conf": np.nanmedian(conf_ba), "BA deconf": np.nanmedian(dec_ba),
+            "F1 conf": np.nanmedian(conf_f1), "F1 deconf": np.nanmedian(dec_f1),
+            "AUC conf": np.nanmedian(conf_auc), "AUC deconf": np.nanmedian(dec_auc),
+            "w_ess_med": float(np.median(ess_runs))}
 
 def main():
-    G = build_causal_graph()
-    result = sid(Y={"Voice"}, X={"PD"}, S={"S_dur", "S_pause"}, D=G)
-    if result is None:
-        print("WARNING: effect NOT transportable with this graph.")
-        return
-    print("sID formula RHS:", result.rhs.tocondstr())
+    Xs, ys, ag, sx, up, gr, pids = load_nv_petaca()
+    print(f"NV Petaca source: {Xs.shape[0]} recordings "
+          f"({int(ys.sum())} PD / {len(ys) - int(ys.sum())} HC), "
+          f"age [{ag.min():.0f}-{ag.max():.0f}], sex 1: {int(sx.sum())}, "
+          f"UPDRS [{up.min():.0f}-{up.max():.0f}] (HC imputed 0), "
+          f"GRBAS-G [0-{int(gr.max())}]")
 
-    X_nv, y_nv, dur_nv, pause_nv = load_neurovoz()
-    X_pc, y_pc, dur_pc, pause_pc, sid_pc = load_parkceleb()
-    print(f"NV: {len(y_nv)} recordings, PC: {len(y_pc)} clips, {len(np.unique(sid_pc))} speakers")
+    intervals = load_pc_intervals()
+    for name, (X, y, s, ta, ts) in intervals.items():
+        print(f"  interval {name:>2}: {X.shape[0]} clips, "
+              f"{len(np.unique(s))} speakers, PD {int(y.sum())}, "
+              f"age [{np.nanmin(ta):.0f}-{np.nanmax(ta):.0f}], "
+              f"sex 1: {int(np.nansum(ts))}")
 
-    pca_ssl = PCA(n_components=1)
-    voice_nv = pca_ssl.fit_transform(StandardScaler().fit_transform(np.nan_to_num(X_nv, nan=0.0))).ravel()
-    voice_pc = pca_ssl.transform(np.nan_to_num(X_pc, nan=0.0)).ravel()
-
-    weights = compute_transport_weights(y_nv, dur_nv, pause_nv, dur_pc, pause_pc)
-    ess = (weights.sum() ** 2) / (weights ** 2).sum()
-    print(f"KDE weights: ESS = {ess:.0f} / {len(y_nv)} ({ess/len(y_nv):.2f})")
-
-    pc_tr, pc_te = train_test_split(np.arange(len(y_pc)), test_size=TEST_SIZE,
-                                    random_state=RANDOM_SEED, stratify=y_pc)
-    scaler_feat = StandardScaler()
-    voice_train_scaled = scaler_feat.fit_transform(voice_pc[pc_tr].reshape(-1, 1))
-    voice_test_scaled = scaler_feat.transform(voice_pc[pc_te].reshape(-1, 1))
-
-    conf_model = fit_logit(voice_train_scaled, y_pc[pc_tr])
-    conf_ba = patient_level_metrics(y_pc[pc_te], predict_logit(conf_model, voice_test_scaled), sid_pc[pc_te])
-
-    nv_data_big = {"Voice": np.tile(voice_nv.reshape(-1, 1), (N_TILE, 1)),
-                   "PD": np.tile(y_nv.reshape(-1, 1), (N_TILE, 1))}
-    weights_big = np.tile(weights, (N_TILE, 1))
-    tcb_bas_list = []
-    for run in range(N_RUNS):
-        bd, _ = bootstrapper(nv_data_big, weights_big, intv_var_name_in_data=["PD"],
-                             mode="fast", random_state=RANDOM_SEED + run)
-        X_boot = bd["Voice"].astype(np.float64)
-        y_boot = bd["intv_PD"].astype(np.int32).ravel()
-        m = fit_logit(StandardScaler().fit_transform(X_boot), y_boot)
-        tcb_bas_list.append(patient_level_metrics(y_pc[pc_te], predict_logit(m, voice_test_scaled), sid_pc[pc_te]))
-
-    tcb_bas, tcb_std = np.mean(tcb_bas_list), np.std(tcb_bas_list)
-    print(f"PC confounded:   BAS = {conf_ba:.4f}")
-    print(f"TCB transported: BAS = {tcb_bas:.4f} ± {tcb_std:.4f}")
-
+    print(f"\n{'int':<4}{'BA conf':>9}{'BA deconf':>10}{'F1 conf':>9}"
+          f"{'F1 deconf':>10}{'AUC conf':>9}{'AUC deconf':>10}")
+    results = {}
+    for name, (X, y, s, ta, ts) in intervals.items():
+        r = run_interval(name, Xs, ys, ag, sx, up, gr, pids, X, y, s, ta, ts)
+        results[name] = r
+        print(f"{name:<4}{r['BA conf']:>9.4f}{r['BA deconf']:>10.4f}"
+              f"{r['F1 conf']:>9.4f}{r['F1 deconf']:>10.4f}"
+              f"{r['AUC conf']:>9.4f}{r['AUC deconf']:>10.4f}")
+        print(f"     dBA = {r['BA deconf'] - r['BA conf']:+.4f}   "
+              f"w ESS (median of {N_BOOT}) = {r['w_ess_med']:.0f}")
 
 if __name__ == "__main__":
     main()

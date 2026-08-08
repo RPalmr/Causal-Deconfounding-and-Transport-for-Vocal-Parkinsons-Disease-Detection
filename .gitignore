@@ -5,5 +5,8 @@ material/
 notes/
 *.txt
 tCB/
-.DS_Store
+*.DS_Store
 dissertation/
+grbas/
+extraction/PARKCELEB
+tests/_archive/

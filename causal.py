@@ -1,240 +1,493 @@
-"""
-Transportable Causal Bootstrapping: NeuroVoz → ParkCeleb
-========================================================
-Bareinboim & Pearl (2013) transportability framework applied to
-Parkinson's detection with 66-dim handcrafted acoustic features.
-
-Selection diagram:  U → X, U → Y, X → Y, S → U
-  - U: latent confound (recording condition, age, clinical factors)
-  - X: 66-dim acoustic features
-  - Y: PD/HC label
-  - S: domain selection (NeuroVoz vs ParkCeleb)
-
-TCB reweights the target samples so P_trg(U) → P_src(U),
-removing the domain-specific confound bias.
-"""
-
-import sys, os, time, warnings
+import sys, re
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.decomposition import PCA
-from scipy.stats import gaussian_kde
+from pathlib import Path
 
-warnings.filterwarnings("ignore")
-
-BASE = os.path.dirname(os.path.abspath(__file__))
-DATA = f"{BASE}/data"
-for p in [f"{BASE}/libraries/GRAPL", f"{BASE}/libraries/CausalBootstrapping", BASE]:
+BASE = Path(__file__).resolve().parent
+for p in [str(BASE) + '/libraries/CausalBootstrapping', str(BASE) + '/libraries/GRAPL',
+          str(BASE) + '/libraries/causal_assistant', str(BASE) + '/tCB', str(BASE) + '/tests']:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-N_FEATS = 66
+import causal_assistant as ca
+import sID_expr as sid_alg
+import grapl.dsl as dsl
+from scipy.stats import gaussian_kde, wilcoxon
+from xgboost import XGBClassifier
+
+import transport_u_age as age
+
+RANDOM_SEED = 42
+N_BOOT = 50000
+N_AGE_BINS = 6
+CB_FIT_METHOD = "kde"
+
+CORPUS_SEP_MAX = 1.0
+META_COLS = {"Unnamed: 0", "tot_name"}
+INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}
+NV_FEAT = str(BASE) + '/data/neurovoz/extracted_features'
 INTENSITY_IDX = slice(0, 38)
-PAUSE_IDX = slice(38, 59)
-SYLLABLE_IDX = slice(59, 66)
+N_FEAT = 66
+IT_TASK_PREFIX = ("FB1", "FB2", "PR1", "B1", "B2")
 
+AGE_GRAPH = "y;X;Age; y->X; Age->X; Age->y;"
+SEL_DIAGRAM = "y;X;Age;U;S; y->X; U->X; Age->X; Age->y; S->U;"
 
-"""data loaders here"""
+def _zscore_fit(X):
+    mu = X.mean(0)
+    sd = X.std(0)
+    return (X - mu) / np.maximum(sd, 1e-12), (mu, sd)
+
+def _zscore_apply(X, p):
+    mu, sd = p
+    return (X - mu) / np.maximum(sd, 1e-12)
+
+def _pca_fit(X, n_components):
+    mu = X.mean(0)
+    Xc = X - mu
+    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+    Vt = _svd_flip(Vt)
+    return mu, Vt[:n_components]
+
+def _pca_apply(X, p):
+    mu, comps = p
+    return (X - mu) @ comps.T
+
+def _svd_flip(Vt):
+    Vt = Vt.copy()
+    mx = np.argmax(np.abs(Vt), axis=1)
+    signs = np.sign(Vt[np.arange(Vt.shape[0]), mx])
+    signs[signs == 0] = 1.0
+    return Vt * signs[:, None]
+
+def _balanced_acc(y, pred):
+    return 0.5 * (np.mean(pred[y == 0] == 0) + np.mean(pred[y == 1] == 1))
+
+def _f1_score(y, pred):
+    tp = np.sum((pred == 1) & (y == 1))
+    fp = np.sum((pred == 1) & (y == 0))
+    fn = np.sum((pred == 0) & (y == 1))
+    if tp == 0:
+        return 0.0
+    p, r = tp / (tp + fp), tp / (tp + fn)
+    return 2 * p * r / (p + r) if p + r > 0 else 0.0
+
+def _roc_auc(y, prob):
+    y = np.asarray(y)
+    pos = y == 1
+    n_pos, n_neg = int(pos.sum()), int((~pos).sum())
+    if n_pos == 0 or n_neg == 0:
+        return np.nan
+    order = np.argsort(prob, kind="mergesort")
+    ranks = np.empty(len(prob), dtype=float)
+    ranks[order] = np.arange(1, len(prob) + 1)
+    return (ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+
+def _corp_sep(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a, b = a[np.isfinite(a)], b[np.isfinite(b)]
+    if len(a) < 2 or len(b) < 2:
+        return 0.5
+    val = np.concatenate([a, b])
+    lab = np.concatenate([np.zeros(len(a)), np.ones(len(b))])
+    return abs(_roc_auc(lab, val) - 0.5)
+
+def _strat_folds(y, n_splits=3, seed=RANDOM_SEED):
+    y = np.asarray(y).astype(int)
+    rng = np.random.RandomState(seed)
+    folds = [[] for _ in range(n_splits)]
+    for c in np.unique(y):
+        idx = rng.permutation(np.where(y == c)[0])
+        for k, i in enumerate(idx):
+            folds[k % n_splits].append(i)
+    all_idx = np.arange(len(y))
+    out = []
+    for f in folds:
+        te = np.asarray(f, dtype=int)
+        tr = np.setdiff1d(all_idx, te)
+        out.append((tr, te))
+    return out
 
 def _stem(x):
-    s = os.path.basename(str(x))
+    s = str(x).rsplit("/", 1)[-1]
     while s.endswith(".wav"):
         s = s[:-4]
     return s.replace("audios-", "").replace("audios/", "")
 
-def _name(a):
-    return os.path.splitext(os.path.basename(str(a)))[0]
+def _sl(df, kv, common, meta_cols):
+    return (df.loc[kv.isin(common)]
+              .loc[:, ~df.columns.isin(meta_cols)]
+              .set_index(kv[kv.isin(common)].values))
 
-def load_neurovoz(include_metadata=True):
-    base = f"{DATA}/neurovoz/extracted_features"
-    intens = pd.read_csv(f"{base}/intensity_features_neurovoz.csv")
-    pause  = pd.read_csv(f"{base}/pause_features_neurovoz.csv")
-    syll   = pd.read_csv(f"{base}/syllable_features_neurovoz.csv")
-    meta_cols = {"Unnamed: 0", "tot_name"}
-    ki = intens["tot_name"].apply(_stem)
-    kp = pause["tot_name"].apply(_stem)
-    ks = syll["tot_name"].apply(_stem)
-    common = sorted(set(ki) & set(kp) & set(ks))
-    def sl(df, kv):
-        return df.loc[kv.isin(common)].loc[:,~df.columns.isin(meta_cols)].set_index(kv[kv.isin(common)].values)
-    X = pd.concat([sl(intens, ki), sl(pause, kp), sl(syll, ks)], axis=1).values.astype(np.float64)
-    Y = np.array([1 if s.startswith("PD_") else 0 for s in common], dtype=np.float64)
+def _rmse(v):
+    return np.sqrt(np.mean(np.asarray(v, dtype=float) ** 2))
 
-    if not include_metadata:
-        ok = ~np.isnan(X).any(axis=1)
-        return X[ok], Y[ok]
+def _sign_agr(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    m = (np.abs(a) + np.abs(b)) > 0
+    if m.sum() == 0:
+        return 1.0
+    return float(np.mean(np.sign(a[m]) == np.sign(b[m])))
 
-    hc = pd.read_csv(f"{DATA}/neurovoz/metadata/metadata_hc.csv")
-    pd_ = pd.read_csv(f"{DATA}/neurovoz/metadata/metadata_pd.csv")
+def _nv_col_order():
+    cols = []
+    for f in ("intensity_features_neurovoz.csv", "pause_features_neurovoz.csv",
+              "syllable_features_neurovoz.csv"):
+        cols += [c for c in pd.read_csv(str(NV_FEAT) + '/' + str(f), nrows=0)
+                 if c not in META_COLS]
+    return cols
+
+def load_nv():
+    hc = pd.read_csv(str(BASE) + '/data/neurovoz/metadata/metadata_hc.csv')
+    pd_ = pd.read_csv(str(BASE) + '/data/neurovoz/metadata/metadata_pd.csv')
     mt = pd.concat([hc, pd_], ignore_index=True)
-    mt["_k"] = mt["Audio"].apply(_name)
-    idx = mt.set_index("_k")
+    mt["_pid"] = mt["ID"].map(lambda i: f"{int(i):04d}")
+    mt["Age"] = pd.to_numeric(mt["Age"], errors="coerce")
+    a_by_pid = mt.groupby("_pid")["Age"].median()
 
-    def _mget(col, default=np.nan):
-        return np.array([idx.loc[k, col] if k in idx.index else default for k in common], dtype=np.float64)
+    intens = pd.read_csv(str(NV_FEAT) + '/intensity_features_neurovoz.csv')
+    pause = pd.read_csv(str(NV_FEAT) + '/pause_features_neurovoz.csv')
+    syll = pd.read_csv(str(NV_FEAT) + '/syllable_features_neurovoz.csv')
+    ki, kp, ks = (intens["tot_name"].apply(_stem),
+                  pause["tot_name"].apply(_stem),
+                  syll["tot_name"].apply(_stem))
+    common = sorted(set(ki) & set(kp) & set(ks))
+    X = pd.concat([_sl(intens, ki, common, META_COLS),
+                   _sl(pause, kp, common, META_COLS),
+                   _sl(syll, ks, common, META_COLS)], axis=1)
+    X = X.values.astype(np.float64)
+    Y = np.array([1 if c.startswith("PD_") else 0 for c in common], dtype=np.float64)
+    pid = np.array([c[-4:] for c in common])
+    ag = np.array([a_by_pid.get(p, np.nan) for p in pid], dtype=np.float64)
+    ok = ~(np.isnan(X).any(axis=1) | np.isnan(ag))
+    return X[ok], Y[ok], ag[ok], pid[ok]
 
-    age    = _mget("Age")
-    sex    = _mget("Sex")
-    tremor = np.where(_mget("Vocal tremor") == 1, 1, 0)
-    hypoph = np.where(_mget("Hypophonic voice") == 1, 1, 0)
-    updrs  = np.where(Y == 0, 0.0, _mget("UPDRS scale"))
-
-    ok = ~(np.isnan(X).any(axis=1) | np.isnan(age) | np.isnan(sex) | np.isnan(tremor) | np.isnan(hypoph) | np.isnan(updrs))
-    return X[ok], Y[ok], age[ok], sex[ok], tremor[ok], hypoph[ok], updrs[ok]
-
-
-def load_parkceleb():
-    base = f"{DATA}/parkceleb_extracted"
-    intens = pd.read_csv(f"{base}/intensity_features_parkceleb.csv")
-    pause  = pd.read_csv(f"{base}/pause_features_parkceleb.csv")
-    syll   = pd.read_csv(f"{base}/syllable_features_parkceleb.csv")
-    meta = {"parkceleb_group","parkceleb_label","speaker_id","video_id",
-            "diarization_speaker","source_type","audio_file","audio_ext","audio_path",
-            "intensity_ok","intensity_error","pause_ok","pause_error",
-            "syllable_ok","syllable_error","tot_name"}
-    X = pd.concat([
-        intens.loc[:,~intens.columns.isin(meta)],
-        pause.loc[:,~pause.columns.isin(meta)],
-        syll.loc[:,~syll.columns.isin(meta)],
-    ], axis=1).values.astype(np.float64)
+def load_pc():
+    base = str(BASE) + '/data/parkceleb_extracted'
+    intens = pd.read_csv(str(base) + '/intensity_features_parkceleb.csv')
+    pause = pd.read_csv(str(base) + '/pause_features_parkceleb.csv')
+    syll = pd.read_csv(str(base) + '/syllable_features_parkceleb.csv')
+    kid = intens["audio_file"].map(
+        lambda f: (lambda m: m.group(1) if m else np.nan)(
+            age.IDRE.search(str(f))))
+    m = kid.notna()
+    intens, pause, syll, kid = (intens[m].reset_index(drop=True),
+                                pause[m].reset_index(drop=True),
+                                syll[m].reset_index(drop=True),
+                                kid[m].reset_index(drop=True))
+    X = pd.concat([intens.loc[:, ~intens.columns.isin(age.FEATURE_META)],
+                   pause.loc[:, ~pause.columns.isin(age.FEATURE_META)],
+                   syll.loc[:, ~syll.columns.isin(age.FEATURE_META)]], axis=1)
+    X = X.values.astype(np.float64)
     Y = intens["parkceleb_label"].values.astype(np.float64)
-    ok = ~np.isnan(X).any(axis=1)
-    return X[ok], Y[ok]
+    sid = intens["speaker_id"].astype(str).values
 
+    ages = pd.read_csv(str(BASE) + '/data/parkceleb_ages.csv')
+    age_by_af = (ages.drop_duplicates("audio_file").set_index("audio_file")["age"])
+    af = intens["audio_file"].astype(str).map(
+        lambda f: f if f in age_by_af.index else np.nan)
+    t_age = af.map(age_by_af).values.astype(np.float64)
 
-"""sID transport formula"""
+    upload = pd.read_csv(str(BASE) + '/data/parkceleb_upload_years.csv')
+    upload["video_id"] = upload["video_id"].astype(str)
+    up_full = upload["upload_date"].astype(str).str[:4]
+    up = up_full[up_full.str.fullmatch(r"\d{4}")].astype(int)
+    up.index = upload.loc[up.index, "video_id"]
 
-def run_sID():
-    import sID_expr as sid_alg
-    import grapl.dsl as dsl
-    D = "U; X; Y; S; U -> X; U -> Y; X -> Y; S -> U;"
-    g = dsl.GraplDSL().readgrapl(D)
-    result = sid_alg.sid(Y={"Y"}, X={"X"}, S={"S"}, D=g)
-    return result.tostr() if result is not None else "NOT TRANSPORTABLE"
+    import openpyxl
+    wb = openpyxl.load_workbook(str(BASE) + '/data/ParkCeleb/PD_demo.xlsx',
+                                read_only=True)
+    rows = list(wb.active.iter_rows(values_only=True))
+    hdr = [str(c).strip().lower().replace(" ", "") for c in rows[0]]
+    yod = {}
+    for r in rows[2:]:
+        if r[0] is None:
+            continue
+        yod[str(r[0]).strip()] = int(str(r[hdr.index("yod")]).strip())
+    wb2 = openpyxl.load_workbook(str(BASE) + '/data/ParkCeleb/speakers_pairs.xlsx',
+                                 read_only=True)
+    rows2 = list(wb2.active.iter_rows(values_only=True))
+    pairs = {}
+    for r in rows2[1:]:
+        if r[0] is None:
+            continue
+        pairs[str(r[0]).strip()] = str(r[1]).strip()
 
+    iv = np.full(len(X), np.nan)
+    for i, sp in enumerate(sid):
+        vid = kid[i]
+        if vid not in up.index:
+            continue
+        uy = up[vid]
+        yr = yod.get(sp) if sp.startswith("pd_") else yod.get(pairs.get(sp))
+        if yr is None:
+            continue
+        iv[i] = uy - yr
 
-"""tcb importance weights"""
+    out = {"full": (X, Y, sid, t_age)}
+    for name, (lo, hi) in INTERVALS.items():
+        sel = (iv >= lo) & (iv <= hi)
+        out[name] = (X[sel], Y[sel], sid[sel], t_age[sel])
+    return out
 
-def tcb_weights(U_src, U_trg, Y_trg):
-    """w = P_src(U) / P_trg(U, Y), normalised to mean=1."""
-    pu_src = gaussian_kde(U_src.ravel())(U_trg.ravel())
-    pu_trg = gaussian_kde(U_trg.ravel())(U_trg.ravel())
-    lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=5000)
-    lr.fit(U_trg.reshape(-1, 1), Y_trg.ravel())
-    py1 = lr.predict_proba(U_trg.reshape(-1, 1))[:, 1]
-    pgu = np.where(Y_trg.ravel() > 0.5, py1, 1 - py1)
-    w = pu_src / (pu_trg * pgu)
-    w /= np.mean(w)
-    return w
+def load_italian():
+    base = str(BASE) + '/data/italian_pipeline'
+    intens = pd.read_csv(str(base) + '/intensity_features_italian.csv')
+    pause = pd.read_csv(str(base) + '/pause_features_italian.csv')
+    syll = pd.read_csv(str(base) + '/syllable_features_italian.csv')
+    man = pd.read_json(str(base) + '/italian_manifest.json')
+    byf = {r["file"]: r for r in man.to_dict("records")}
+    key = intens["tot_name"].astype(str)
+    key = key.map(lambda k: k if k in byf else np.nan)
+    m = key.notna().to_numpy()
+    intens, pause, syll, key = (intens[m].reset_index(drop=True),
+                                pause[m].reset_index(drop=True),
+                                syll[m].reset_index(drop=True),
+                                key[m].reset_index(drop=True))
 
+    def feats(df):
+        return [c for c in df.columns if c != "tot_name"]
 
-"""confound estimation"""
+    ncol = _nv_col_order()
+    n_i, n_p, n_s = ncol[:38], ncol[38:59], ncol[59:66]
+    X = pd.concat([intens[n_i] if all(c in intens.columns for c in n_i)
+                   else intens[feats(intens)].reindex(columns=n_i),
+                   pause[n_p] if all(c in pause.columns for c in n_p)
+                   else pause[feats(pause)].reindex(columns=n_p),
+                   syll[n_s] if all(c in syll.columns for c in n_s)
+                   else syll[feats(syll)].reindex(columns=n_s)],
+                  axis=1).values.astype(np.float64)
+    Y = key.map(lambda k: byf[k]["label"]).to_numpy().astype(np.float64)
+    ag = key.map(lambda k: byf[k]["age"]).to_numpy().astype(np.float64)
+    sid = key.map(_it_subject).to_numpy()
+    ok = ~(np.isnan(X).any(axis=1) | np.isnan(ag))
+    return X[ok], Y[ok], ag[ok], sid[ok]
 
-def estimate_confound(nv_X, pc_X, nv_Y, pc_Y, method="pca_min_corr"):
-    """Estimate latent confound U from the domain shift between NeuroVoz and ParkCeleb."""
-    if method == "pca_min_corr":
-        pca = PCA(n_components=5)
-        L_nv = pca.fit_transform(nv_X[:, INTENSITY_IDX])
-        corrs = np.array([abs(np.corrcoef(L_nv[:, i], nv_Y)[0, 1])
-                          for i in range(5)])
-        best_k = int(np.argmin(corrs))
-        U_nv = L_nv[:, best_k]
-        U_pc = pca.transform(pc_X[:, INTENSITY_IDX])[:, best_k]
-        print(f"    U = PC{best_k+1}  (|r(Y)|={corrs[best_k]:.3f})")
-    elif method == "pca_src":
-        pca = PCA(n_components=1)
-        pca.fit(nv_X[:, INTENSITY_IDX])
-        U_nv = pca.transform(nv_X[:, INTENSITY_IDX]).ravel()
-        U_pc = pca.transform(pc_X[:, INTENSITY_IDX]).ravel()
-    elif method == "mean_diff":
-        mu_nv = np.mean(nv_X[:, INTENSITY_IDX], axis=0)
-        mu_pc = np.mean(pc_X[:, INTENSITY_IDX], axis=0)
-        d = mu_pc - mu_nv
-        d = d / np.linalg.norm(d)
-        U_nv = nv_X[:, INTENSITY_IDX] @ d
-        U_pc = pc_X[:, INTENSITY_IDX] @ d
-    return U_nv, U_pc
+def _it_subject(k):
+    s = str(k).rsplit("/", 1)[-1]
+    while s.endswith(".wav"):
+        s = s[:-4]
+    for t in IT_TASK_PREFIX:
+        if s.startswith(t):
+            s = s[len(t):]
+            break
+    s = re.sub(r"\d+$", "", s)
+    return s or str(k)
 
+def _u_axis(X_nv, X_tgt_all, y_nv):
+    nv_i = X_nv[:, INTENSITY_IDX]
+    stacked = np.vstack([nv_i, X_tgt_all[:, INTENSITY_IDX]])
+    zs = np.maximum(1e-12, stacked.std(0))
+    ns = (nv_i - stacked.mean(0)) / zs
+    mu2, comps = _pca_fit(ns, 5)
+    Z = _pca_apply(ns, (mu2, comps))
+    corrs = np.array([abs(np.corrcoef(Z[:, k], y_nv)[0, 1]) for k in range(5)])
+    k = int(np.argmin(corrs))
+    axis = (stacked.mean(0), zs, mu2, comps, k)
+    return Z[:, k], axis
 
-"""training helper"""
+def _u_proj(X_t, axis):
+    stacked_mean, zs, mu2, comps, k = axis
+    ns = (X_t[:, INTENSITY_IDX] - stacked_mean) / zs
+    return _pca_apply(ns, (mu2, comps))[:, k]
 
-def train_clf(train_X, train_Y, test_X, test_Y, sample_weight=None, seed=42):
-    clf = LogisticRegression(C=1e6, solver="lbfgs", max_iter=5000, random_state=seed)
-    clf.fit(train_X, train_Y, sample_weight=sample_weight)
-    p = clf.predict_proba(test_X)[:, 1]
-    return dict(auc=roc_auc_score(test_Y, p),
-                acc=accuracy_score(test_Y, (p > 0.5).astype(float)),
-                f1=f1_score(test_Y, (p > 0.5).astype(float)))
+def _ratio(U_s, U_t):
+    if len(U_t) < 2 or np.std(U_t) < 1e-9 or np.std(U_s) < 1e-9:
+        return np.ones(len(U_s))
+    k_t, k_s = gaussian_kde(U_t), gaussian_kde(U_s)
+    r = k_t(U_s) / np.maximum(k_s(U_s), 1e-12)
+    lo, hi = np.percentile(r, 1), np.percentile(r, 99)
+    return np.clip(r, lo, hi)
 
+def _cb(X, y, ag):
+    W = np.asarray(ca.causal_weights(causal_graph=AGE_GRAPH, cause_var="y",
+                                     effect_var="X", fit_method=CB_FIT_METHOD,
+                                     X=X, y=y, Age=(ag, N_AGE_BINS)))
+    return W
 
-"""Cross-domain (NeuroVoz → ParkCeleb)"""
+def _effect_vec(X, w1, w0):
+    s1, s0 = w1.sum(), w0.sum()
+    if s1 <= 0 or s0 <= 0:
+        return np.zeros(X.shape[1])
+    return (X * w1[:, None]).sum(0) / s1 - (X * w0[:, None]).sum(0) / s0
 
-def cross_domain():
-    """
-    Transport causal knowledge from NeuroVoz (source) to ParkCeleb (target).
-    
-    TCB reweights ParkCeleb samples to match NeuroVoz's confound distribution,
-    removing the domain-specific bias.
-    """
-    N_REPS = 1000
-    print("  Cross-domain transport NeuroVoz → ParkCeleb:")
+def _local_effect(Xt, yt, age_t):
+    med = np.nanmedian(age_t)
+    a = np.where(np.isfinite(age_t), age_t, med) - med
+    mu, sd = Xt.mean(0), Xt.std(0)
+    sd = np.maximum(sd, np.median(sd) * 0.05)
+    Xz = (Xt - mu) / sd
+    A = np.column_stack([np.ones(len(yt)), yt, a])
+    return np.linalg.lstsq(A, Xz, rcond=None)[0][1]
 
-    nv_X, nv_Y = load_neurovoz(include_metadata=False)
-    pc_X, pc_Y = load_parkceleb()
+def _cluster_sel(units, rng):
+    u = np.unique(units)
+    return np.isin(units, rng.choice(u, size=len(u), replace=True))
 
-    nv_ok = ~np.isnan(nv_X).any(axis=1)
-    pc_ok = ~np.isnan(pc_X).any(axis=1)
-    nv_X, nv_Y = nv_X[nv_ok], nv_Y[nv_ok]
-    pc_X, pc_Y = pc_X[pc_ok], pc_Y[pc_ok]
+def _run_target(Xs, ys, ags, pids, Xt, yt, sidt, agt, r, rng, n_boot):
+    cb, raw, plac, loc = [], [], [], []
+    for _ in range(n_boot):
+        s = _cluster_sel(pids, rng)
+        W = _cb(Xs[s], ys[s], ags[s])
+        cb.append(_effect_vec(Xs[s], W[:, 1] * r[s], W[:, 0] * r[s]))
+        raw.append(_effect_vec(Xs[s], (ys[s] == 1).astype(float),
+                               (ys[s] == 0).astype(float)))
+        yp = rng.permutation(ys[s])
+        Wp = _cb(Xs[s], yp, ags[s])
+        plac.append(_effect_vec(Xs[s], Wp[:, 1], Wp[:, 0]))
+        th = _cluster_sel(sidt, rng)
+        loc.append(_local_effect(Xt[th], yt[th], agt[th]))
+    return dict(cb=np.array(cb), raw=np.array(raw),
+                plac=np.array(plac), loc=np.array(loc))
 
-    print(f"    NeuroVoz: {len(nv_Y)} samples (PD={int(nv_Y.sum())}, HC={len(nv_Y)-int(nv_Y.sum())})")
-    print(f"    ParkCeleb: {len(pc_Y)} samples (PD={int(pc_Y.sum())}, HC={len(pc_Y)-int(pc_Y.sum())})")
+GBC_PARAMS = dict(n_estimators=100, learning_rate=0.1, max_depth=3,
+                  min_child_weight=3, random_state=RANDOM_SEED, verbosity=0)
+CLF_CV_FOLDS = 3
 
-    scaler = StandardScaler()
-    pool_X = np.vstack([nv_X, pc_X])
-    pool_X = scaler.fit_transform(pool_X)
-    nv_X = pool_X[:len(nv_Y)]
-    pc_X = pool_X[len(nv_Y):]
+def _gbc(X, y, w=None):
+    clf = XGBClassifier(**GBC_PARAMS)
+    if w is not None:
+        w = np.asarray(w, dtype=float)
+        w = w * (len(X) / w.sum())
+    clf.fit(np.asarray(X), y.astype(int), sample_weight=w)
+    return clf
 
-    U_nv, U_pc = estimate_confound(nv_X, pc_X, nv_Y, pc_Y, method="pca_min_corr")
+def _metrics(y, prob):
+    y = np.asarray(y)
+    yi = y.astype(int)
+    pred = (np.asarray(prob) >= 0.5).astype(int)
+    acc = np.mean(pred == yi)
+    ba = _balanced_acc(yi, pred)
+    f1v = _f1_score(yi, pred)
+    auc = _roc_auc(yi, prob)
+    return acc, ba, f1v, auc
 
-    results = {k: [] for k in ["Standard", "TCB-Weighted"]}
-    for rep in range(N_REPS):
-        seed = 42 + rep
-        rng = np.random.default_rng(seed)
-        N_pc = len(pc_X)
-        perm = rng.permutation(N_pc)
-        n_train = int(0.8 * N_pc)
-        i_tr, i_te = perm[:n_train], perm[n_train:]
+def _fmt(m):
+    return str(round((m[0]), 2)) + '/' + str(round((m[1]), 2)) + '/' + str(round((m[2]), 2)) + '/' + str(round((m[3]), 2))
 
-        tr_X, tr_Y = pc_X[i_tr], pc_Y[i_tr]
-        te_X, te_Y = pc_X[i_te], pc_Y[i_te]
+def _source_cv(Xs, ys, ws, folds=CLF_CV_FOLDS):
+    folds_idx = _strat_folds(ys, folds, RANDOM_SEED)
+    out = {}
+    for arm, w in (("raw", None), ("cb", ws)):
+        acc = []
+        for tr, te in folds_idx:
+            g = _gbc(Xs[tr], ys[tr], None if w is None else w[tr])
+            acc.append(_metrics(ys[te], g.predict_proba(Xs[te])[:, 1]))
+        out[arm] = np.mean(np.asarray(acc), axis=0)
+    return out
 
-        tcb_w = tcb_weights(U_nv, U_pc[i_tr], tr_Y)
+def main():
+    print("sID transportability check ...", flush=True)
+    try:
+        g = dsl.GraplDSL().readgrapl(SEL_DIAGRAM)
+        f = sid_alg.sid(Y={"X"}, X={"y"}, S={"S"}, D=g)
+        print("   P*(X|do(y)) =", None if f is None else f.rhs.tocondstr(),
+              flush=True)
+    except Exception as e:
+        print("   sID skipped:", type(e).__name__, e, flush=True)
+    print()
 
-        results["Standard"].append(train_clf(tr_X, tr_Y, te_X, te_Y, seed=seed))
-        results["TCB-Weighted"].append(train_clf(tr_X, tr_Y, te_X, te_Y,
-                                                   sample_weight=tcb_w, seed=seed))
+    Xs, ys, ags, pids = load_nv()
+    if ags.size > 0:
+        age_str = 'age [' + str(int(np.nanmin(ags))) + '-' + str(int(np.nanmax(ags))) + ']'
+    else:
+        age_str = 'age [no data]'
+    print('nv: ' + str(Xs.shape[0]) + ' recordings (' + str(int(ys.sum())) + ' pd / ' + str(len(ys) - int(ys.sum())) + ' hc), ' + age_str, flush=True)
 
-        print(f"    Rep {rep+1:2d}/{N_REPS}:  "
-              f"Std AUC={results['Standard'][-1]['auc']:.3f}  "
-              f"TCB AUC={results['TCB-Weighted'][-1]['auc']:.3f}")
+    mu_s, sd_s = Xs.mean(0), Xs.std(0)
+    sd_s = np.maximum(sd_s, np.median(sd_s) * 0.05)
+    Xs = (Xs - mu_s) / sd_s
 
-    auc_std = np.mean([r["auc"] for r in results["Standard"]])
-    auc_tcb = np.mean([r["auc"] for r in results["TCB-Weighted"]])
-    print(f"\n    Standard (ParkCeleb):       AUC={auc_std:.3f}")
-    print(f"    TCB Transported (NV→PC):    AUC={auc_tcb:.3f}")
-    print(f"    Causal transport gain:       {auc_tcb - auc_std:+.4f}")
-    return results
+    pc = load_pc()
+    it = load_italian()
+    zt = lambda X: (np.asarray(X, dtype=float) - mu_s) / sd_s
+    itm = ~np.isnan(it[0]).any(axis=1) & np.isfinite(it[2])
+    targets = {"ITALIAN": (zt(it[0][itm]), it[1][itm], it[3][itm], it[2][itm])}
+    for name, (X, y, s, a) in pc.items():
+        m = ~np.isnan(X).any(axis=1)
+        targets[name.upper()] = (zt(X[m]), y[m], s[m], a[m])
 
+    Zfull = Xs
+    pool = np.vstack([zt(pc[k][0]) for k in pc])
+    sep = np.array([_corp_sep(Zfull[:, f], pool[:, f]) for f in range(N_FEAT)])
+    keep = sep <= CORPUS_SEP_MAX
+    Xs = Zfull[:, keep]
+    cols = _nv_col_order()
+    top = [cols[i] for i in np.argsort(sep)[-6:][::-1]]
+    print('corpus-sep audit: kept ' + str(int(keep.sum())) + '/' + str(N_FEAT) + ' features (threshold ' + str(CORPUS_SEP_MAX) + '); most corpus-separated: ' + str(', '.join(top)),
+          flush=True)
 
-"""core code structure"""
+    U_nv, uaxis = _u_axis(Zfull, pool, ys)
+    print('u = pc' + str(uaxis[4] + 1) + ' of nv intensity block (min-|corr| with y)',
+          flush=True)
+
+    rng = np.random.RandomState(RANDOM_SEED)
+    hdr = (str('target') + str('n') + str('|tau| cb') + str('95% CI') + str('|tau| raw') + str('|tau| plac') + str('|tau| loc') + str('frac>0') + str('agr'))
+    print(hdr)
+
+    gates = []
+    for name, (Xt, yt, sidt, agt) in targets.items():
+        n_clips, n_spk = len(yt), int(np.unique(sidt).size)
+        U_pc = _u_proj(Xt, uaxis)
+        r = _ratio(U_nv, U_pc)
+        Xc = Xt[:, keep]
+
+        B = _run_target(Xs, ys, ags, pids, Xc, yt, sidt, agt, r, rng, N_BOOT)
+        cb, raw, plac, loc = B["cb"], B["raw"], B["plac"], B["loc"]
+        rm = lambda a: np.sqrt(np.mean(a ** 2, axis=1))
+        crm, rrm, prm, lrm = rm(cb), rm(raw), rm(plac), rm(loc)
+        lo, hi = np.percentile(crm, 2.5), np.percentile(crm, 97.5)
+
+        W_all = _cb(Xs, ys, ags)
+        cb_pt = _effect_vec(Xs, W_all[:, 1] * r, W_all[:, 0] * r)
+        loc_pt = _local_effect(Xc, yt, agt)
+        agr = _sign_agr(cb_pt, loc_pt)
+
+        lo_f = np.percentile(cb, 2.5, axis=0)
+        hi_f = np.percentile(cb, 97.5, axis=0)
+        frac0 = float(np.mean((lo_f > 0) | (hi_f < 0)))
+
+        dd = crm - rrm
+        pval = 1.0
+        if np.any(dd) and len(np.unique(dd)) > 1:
+            try:
+                _, pval = wilcoxon(dd)
+            except ValueError:
+                pval = 1.0
+
+        print(str(name) + ' ' + str(n_clips) + ' ' + str(np.median(crm)) + '[' + str(lo) + ',' + str(hi) + ']' + str(np.median(rrm)) + str(np.median(prm)) + str(np.median(lrm)) + str(frac0) + str(agr), flush=True)
+        gates.append(dict(target=name, lo=lo, hi=hi, agr=agr,
+                          p_deconf=pval, plac=np.median(prm)))
+
+    print()
+    print("Gates (pre-committed in tests/gates.txt):")
+    n1 = sum(1 for g in gates if g["lo"] > 0)
+    n2 = sum(1 for g in gates if g["agr"] >= 0.5)
+    n3 = sum(1 for g in gates if g["p_deconf"] < 0.05)
+    n4 = sum(1 for g in gates if g["plac"] < 0.25 * max(0.01, g["lo"]))
+    print(' g1 |tau|_cb 95%-ci lower > 0 on ' + str(n1) + '/' + str(len(gates)) + ' targets')
+    print(' g2 sign agreement cb vs localized >= .5 on ' + str(n2) + '/' + str(len(gates)) + ' targets')
+    print(' g3 cb differs from raw assoc (p<.05) on ' + str(n3) + '/' + str(len(gates)) + ' targets')
+    print(' g4 placebo |tau| < .25*cb lower-ci on ' + str(n4) + '/' + str(len(gates)) + ' targets')
+
+    W_all = _cb(Xs, ys, ags)
+    w_cb = W_all[np.arange(len(ys)), ys.astype(int)]
+    cvr = _source_cv(Xs, ys, w_cb)
+    print()
+    print("Predictive transfer (§5.3 GBC  acc / BA / F1 / AUC @ 0.5 thr):")
+    print(str('source-cv') + ' ' + str(len(ys)) + ' ' + ' raw ' + str(_fmt(cvr['raw'])) + ' cb ' + str(_fmt(cvr['cb'])) + ' plac n/a')
+    yp = rng.permutation(ys)
+    gb = {"raw": _gbc(Xs, ys),
+          "cb": _gbc(Xs, ys, w_cb),
+          "plac": _gbc(Xs, yp)}
+    print(str('target') + ' ' + str('n') + ' ' + ' ' + str('raw') + ' ' + ' ' + str('cb') + ' ' + ' ' + str('plac') + ' ')
+    for name, (Xt, yt, sidt, agt) in targets.items():
+        Xc = Xt[:, keep]
+        row = []
+        for arm in ("raw", "cb", "plac"):
+            row.append(_fmt(_metrics(yt, gb[arm].predict_proba(Xc)[:, 1])))
+        print(str(name) + ' ' + str(len(yt)) + ' ' + ' ' + str(row[0]) + ' ' + ' ' + str(row[1]) + ' ' + ' ' + str(row[2]) + ' ')
 
 if __name__ == "__main__":
-    t0 = time.time()
-    print(f"  sID transport formula: {run_sID()}\n")
-    cross_domain()
-    print(f"\n  Time: {time.time()-t0:.0f}s")
+    main()
