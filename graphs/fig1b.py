@@ -4,7 +4,7 @@ Edges: y->X, y<->X (unobserved common effect), S->Z.
 Because Z is independent of (X,y), the effect is directly transportable:
 P*(X|do(y)) = P(X|do(y)); no recalibration is applied (weights are 1).
 """
-import sys, re, os
+import sys, os
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -15,53 +15,24 @@ for p in [str(BASE) + '/libraries/CausalBootstrapping', str(BASE) + '/libraries/
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import causal_assistant as ca
 import sID_expr as sid_alg
 import grapl.dsl as dsl
-from scipy.stats import gaussian_kde, ks_2samp
+from scipy.stats import ks_2samp
 from sklearn.ensemble import GradientBoostingClassifier
 
 import transport_u_age as age
 
 RANDOM_SEED = 42
 N_BOOT = 50
-N_AGE_BINS = 6
-CB_FIT_METHOD = "kde"
 
-CORPUS_SEP_MAX = 1.0
 META_COLS = {"Unnamed: 0", "tot_name"}
 INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}
 NV_FEAT = str(BASE) + '/data/neurovoz/extracted_features'
-N_FEAT = 66
 
 NAME = "Figure 1(b) -- Z=proxy, no causal path to X or y; directly transportable"
 SEL_DIAGRAM = "y;X;Z;S; y->X; y<->X; S->Z;"
 CB_GRAPH = "y;X; y->X;"
 FORMULA = "P*(X|do(y)) = P(X|do(y))   [no recalibration]"
-Z_SRC_VAR = "none"
-
-
-def _roc_auc(y, prob):
-    y = np.asarray(y)
-    pos = y == 1
-    n_pos, n_neg = int(pos.sum()), int((~pos).sum())
-    if n_pos == 0 or n_neg == 0:
-        return np.nan
-    order = np.argsort(prob, kind="mergesort")
-    ranks = np.empty(len(prob), dtype=float)
-    ranks[order] = np.arange(1, len(prob) + 1)
-    return (ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-
-
-def _corp_sep(a, b):
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    a, b = a[np.isfinite(a)], b[np.isfinite(b)]
-    if len(a) < 2 or len(b) < 2:
-        return 0.5
-    val = np.concatenate([a, b])
-    lab = np.concatenate([np.zeros(len(a)), np.ones(len(b))])
-    return abs(_roc_auc(lab, val) - 0.5)
 
 
 def _stem(x):
@@ -208,27 +179,19 @@ def _gbc(X, y, w=None):
     return clf
 
 
-def _cb(X, y, ag, z=None):
-    kwargs = dict(causal_graph=CB_GRAPH, cause_var="y",
-                  effect_var="X", fit_method=CB_FIT_METHOD,
-                  X=X, y=y)
-    if "Age" in CB_GRAPH:
-        kwargs["Age"] = (ag, N_AGE_BINS)
-    if "Z" in CB_GRAPH:
-        raise ValueError("fig 1(b) graph has Z but no z values passed")
-        W = np.asarray(ca.causal_weights(**kwargs))
-    return W
+def _cb(X, y):
+    return np.ones((len(X), 2))
+
 def _cluster_sel(units, rng):
     u = np.unique(units)
     return np.isin(units, rng.choice(u, size=len(u), replace=True))
 
 
-def _run_target(Xs, ys, ags, pids, Xt, yt, r, rng, n_boot, z_src):
+def _run_target(Xs, ys, pids, Xt, yt, r, rng, n_boot):
     cb_ba, raw_ba = [], []
     for _ in range(n_boot):
         s = _cluster_sel(pids, rng)
-        zs_ = None if z_src is None else z_src[s]
-        W = _cb(Xs[s], ys[s], ags[s], z=zs_)
+        W = _cb(Xs[s], ys[s])
         w1 = np.maximum(W[:, 1] * r[s], 0.0)
         w1 = w1 + 1e-6 * np.maximum(w1.mean(), 1e-12)
         g_cb = _gbc(Xs[s], ys[s], w1)
@@ -251,7 +214,7 @@ def main():
     print()
     print("== " + NAME + " ==", flush=True)
 
-    Xs, ys, ags, pids, _, _, drs_nv = load_nv()
+    Xs, ys, ags, pids, _, _, _ = load_nv()
     if ags.size > 0:
         age_str = 'age [' + str(int(np.nanmin(ags))) + '-' + str(int(np.nanmax(ags))) + ']'
     else:
@@ -270,24 +233,18 @@ def main():
         m = ~np.isnan(X).any(axis=1)
         targets[name.upper()] = (zt(X[m]), y[m], s[m], a[m], iv[m])
 
-    Zfull = Xs
-    pool = np.vstack([zt(pc[k][0]) for k in pc])
-    sep = np.array([_corp_sep(Zfull[:, f], pool[:, f]) for f in range(N_FEAT)])
-    keep = sep <= CORPUS_SEP_MAX
-    Xs = Zfull[:, keep]
-
     rng = np.random.RandomState(RANDOM_SEED)
     hdr = ('target n ba_cb ba_raw ks_p')
     print(hdr)
 
     ks_res = []
-    for name, (Xt, yt, sidt, agt, ivt) in targets.items():
-        n_clips, n_spk = len(yt), int(np.unique(sidt).size)
-        Xc = Xt[:, keep]
+    for name, (Xt, yt, _, _, _) in targets.items():
+        n_clips = len(yt)
+        Xc = Xt
 
         r = np.ones(len(ys))
 
-        B = _run_target(Xs, ys, ags, pids, Xc, yt, r, rng, N_BOOT, None)
+        B = _run_target(Xs, ys, pids, Xc, yt, r, rng, N_BOOT)
         cb_ba, raw_ba = B["cb"], B["raw"]
 
         p = 1.0
