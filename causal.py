@@ -1,8 +1,7 @@
-import sys, re
+import sys, os
 import numpy as np
 import pandas as pd
 from pathlib import Path
-
 
 BASE = Path(__file__).resolve().parent
 for p in [str(BASE) + '/libraries/CausalBootstrapping', str(BASE) + '/libraries/GRAPL',
@@ -11,58 +10,49 @@ for p in [str(BASE) + '/libraries/CausalBootstrapping', str(BASE) + '/libraries/
         sys.path.insert(0, p)
 
 import causal_assistant as ca
-import sID_expr as sid_alg
-import grapl.dsl as dsl
-from scipy.stats import gaussian_kde, wilcoxon
-from xgboost import XGBClassifier
+from scipy.stats import gaussian_kde, ks_2samp
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler as _SS
 
 import transport_u_age as age
 
 RANDOM_SEED = 42
-N_BOOT = 50000
+N_REPS = 200
 N_AGE_BINS = 6
 CB_FIT_METHOD = "kde"
-
-CORPUS_SEP_MAX = 1.0
 META_COLS = {"Unnamed: 0", "tot_name"}
-INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}
 NV_FEAT = str(BASE) + '/data/neurovoz/extracted_features'
 INTENSITY_IDX = slice(0, 38)
-N_FEAT = 66
-IT_TASK_PREFIX = ("FB1", "FB2", "PR1", "B1", "B2")
 
 AGE_GRAPH = "y;X;Age; y->X; Age->X; Age->y;"
-SEL_DIAGRAM = "y;X;Age;U;S; y->X; U->X; Age->X; Age->y; S->U;"
+UPDRS_EDGES = [0, 10, 20, 40, 70, 200]
+GRBAS_EDGES = [0, 1, 2, 3, 4]
+GRAPH_MODELS = {
+    "age":   "y;X;Age; y->X; Age->X; Age->y;",
+    "grbas": "y;X;Age;GRBAS; y->X; Age->X; Age->y; y->GRBAS; GRBAS->X;",
+    "updrs": "y;X;Age;UPDRS; y->X; Age->X; Age->y; y->UPDRS; UPDRS->X;",
+    "both":  "y;X;Age;UPDRS;GRBAS; y->X; Age->X; Age->y; y->UPDRS; UPDRS->X; "
+             "y->GRBAS; GRBAS->X;",
+    "g-as[a]":   "y;X;Age;Sex;GRBAS; y->X; Age->X; Age->y; Sex->X; Sex->y; "
+                 "y->GRBAS; GRBAS->X;",
+    "ug-as[a]":  "y;X;Age;Sex;UPDRS;GRBAS; y->X; Age->X; Age->y; Sex->X; Sex->y; "
+                 "y->UPDRS; UPDRS->X; y->GRBAS; GRBAS->X;",
+    "xy":    "y;X; X->y;",
+}
+INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}
 
-def _zscore_fit(X):
-    mu = X.mean(0)
-    sd = X.std(0)
-    return (X - mu) / np.maximum(sd, 1e-12), (mu, sd)
-
-def _zscore_apply(X, p):
-    mu, sd = p
-    return (X - mu) / np.maximum(sd, 1e-12)
-
-def _pca_fit(X, n_components):
-    mu = X.mean(0)
-    Xc = X - mu
-    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
-    Vt = _svd_flip(Vt)
-    return mu, Vt[:n_components]
-
-def _pca_apply(X, p):
-    mu, comps = p
-    return (X - mu) @ comps.T
-
-def _svd_flip(Vt):
-    Vt = Vt.copy()
-    mx = np.argmax(np.abs(Vt), axis=1)
-    signs = np.sign(Vt[np.arange(Vt.shape[0]), mx])
-    signs[signs == 0] = 1.0
-    return Vt * signs[:, None]
+SYNTH_QY_CONF = 0.80
+SYNTH_QY_UNCONF = 0.50
+SYNTH_QY_REV = 0.20
+SYNTH_QYZ = 0.95
+SYNTH_BRIGHT = 1.0
 
 def _balanced_acc(y, pred):
-    return 0.5 * (np.mean(pred[y == 0] == 0) + np.mean(pred[y == 1] == 1))
+    p0 = np.mean(pred[y == 0] == 0) if np.any(y == 0) else np.nan
+    p1 = np.mean(pred[y == 1] == 1) if np.any(y == 1) else np.nan
+    return 0.5 * (p0 + p1)
 
 def _f1_score(y, pred):
     tp = np.sum((pred == 1) & (y == 1))
@@ -84,31 +74,21 @@ def _roc_auc(y, prob):
     ranks[order] = np.arange(1, len(prob) + 1)
     return (ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
 
-def _corp_sep(a, b):
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    a, b = a[np.isfinite(a)], b[np.isfinite(b)]
-    if len(a) < 2 or len(b) < 2:
-        return 0.5
-    val = np.concatenate([a, b])
-    lab = np.concatenate([np.zeros(len(a)), np.ones(len(b))])
-    return abs(_roc_auc(lab, val) - 0.5)
+def _metrics(y, prob):
+    y = np.asarray(y)
+    yi = y.astype(int)
+    pred = (np.asarray(prob) >= 0.5).astype(int)
+    acc = np.mean(pred == yi)
+    ba = _balanced_acc(yi, pred)
+    f1v = _f1_score(yi, pred)
+    auc = _roc_auc(yi, prob)
+    return acc, ba, f1v, auc
 
-def _strat_folds(y, n_splits=3, seed=RANDOM_SEED):
-    y = np.asarray(y).astype(int)
-    rng = np.random.RandomState(seed)
-    folds = [[] for _ in range(n_splits)]
-    for c in np.unique(y):
-        idx = rng.permutation(np.where(y == c)[0])
-        for k, i in enumerate(idx):
-            folds[k % n_splits].append(i)
-    all_idx = np.arange(len(y))
-    out = []
-    for f in folds:
-        te = np.asarray(f, dtype=int)
-        tr = np.setdiff1d(all_idx, te)
-        out.append((tr, te))
-    return out
+def _nan_mean(a, axis=0):
+    return np.nanmean(np.asarray(a, dtype=float), axis=axis)
+
+def _nan_std(a, axis=0):
+    return np.nanstd(np.asarray(a, dtype=float), axis=axis)
 
 def _stem(x):
     s = str(x).rsplit("/", 1)[-1]
@@ -121,24 +101,6 @@ def _sl(df, kv, common, meta_cols):
               .loc[:, ~df.columns.isin(meta_cols)]
               .set_index(kv[kv.isin(common)].values))
 
-def _rmse(v):
-    return np.sqrt(np.mean(np.asarray(v, dtype=float) ** 2))
-
-def _sign_agr(a, b):
-    a, b = np.asarray(a), np.asarray(b)
-    m = (np.abs(a) + np.abs(b)) > 0
-    if m.sum() == 0:
-        return 1.0
-    return float(np.mean(np.sign(a[m]) == np.sign(b[m])))
-
-def _nv_col_order():
-    cols = []
-    for f in ("intensity_features_neurovoz.csv", "pause_features_neurovoz.csv",
-              "syllable_features_neurovoz.csv"):
-        cols += [c for c in pd.read_csv(str(NV_FEAT) + '/' + str(f), nrows=0)
-                 if c not in META_COLS]
-    return cols
-
 def load_nv():
     hc = pd.read_csv(str(BASE) + '/data/neurovoz/metadata/metadata_hc.csv')
     pd_ = pd.read_csv(str(BASE) + '/data/neurovoz/metadata/metadata_pd.csv')
@@ -146,6 +108,21 @@ def load_nv():
     mt["_pid"] = mt["ID"].map(lambda i: f"{int(i):04d}")
     mt["Age"] = pd.to_numeric(mt["Age"], errors="coerce")
     a_by_pid = mt.groupby("_pid")["Age"].median()
+    mt["Sex"] = pd.to_numeric(mt["Sex"], errors="coerce")
+    s_by_pid = mt.groupby("_pid")["Sex"].median()
+    mt["UPDRS scale"] = pd.to_numeric(mt["UPDRS scale"], errors="coerce")
+    u_by_pid = mt.groupby("_pid")["UPDRS scale"].median()
+
+    grbas = {}
+    for f in os.listdir(str(BASE) + '/data/grbas'):
+        if not f.endswith(".csv"):
+            continue
+        for _, r in pd.read_csv(str(BASE) + '/data/grbas/' + f).iterrows():
+            gid = os.path.splitext(os.path.basename(str(r["text_patient_id"])))[0].strip()
+            try:
+                grbas[gid] = float(r["G"])
+            except (ValueError, TypeError):
+                pass
 
     intens = pd.read_csv(str(NV_FEAT) + '/intensity_features_neurovoz.csv')
     pause = pd.read_csv(str(NV_FEAT) + '/pause_features_neurovoz.csv')
@@ -161,8 +138,12 @@ def load_nv():
     Y = np.array([1 if c.startswith("PD_") else 0 for c in common], dtype=np.float64)
     pid = np.array([c[-4:] for c in common])
     ag = np.array([a_by_pid.get(p, np.nan) for p in pid], dtype=np.float64)
-    ok = ~(np.isnan(X).any(axis=1) | np.isnan(ag))
-    return X[ok], Y[ok], ag[ok], pid[ok]
+    sx = np.array([s_by_pid.get(p, np.nan) for p in pid], dtype=np.float64)
+    up = np.array([np.nan if np.isnan(u_by_pid.get(p, np.nan)) else
+                   u_by_pid.get(p, np.nan) for p in pid], dtype=np.float64)
+    gr = np.array([grbas.get(c[3:], np.nan) for c in common], dtype=np.float64)
+    ok = ~(np.isnan(X).any(axis=1) | np.isnan(ag) | np.isnan(sx))
+    return X[ok], Y[ok], ag[ok], sx[ok], pid[ok], up[ok], gr[ok]
 
 def load_pc():
     base = str(BASE) + '/data/parkceleb_extracted'
@@ -232,263 +213,240 @@ def load_pc():
         out[name] = (X[sel], Y[sel], sid[sel], t_age[sel])
     return out
 
-def load_italian():
-    base = str(BASE) + '/data/italian_pipeline'
-    intens = pd.read_csv(str(base) + '/intensity_features_italian.csv')
-    pause = pd.read_csv(str(base) + '/pause_features_italian.csv')
-    syll = pd.read_csv(str(base) + '/syllable_features_italian.csv')
-    man = pd.read_json(str(base) + '/italian_manifest.json')
-    byf = {r["file"]: r for r in man.to_dict("records")}
-    key = intens["tot_name"].astype(str)
-    key = key.map(lambda k: k if k in byf else np.nan)
-    m = key.notna().to_numpy()
-    intens, pause, syll, key = (intens[m].reset_index(drop=True),
-                                pause[m].reset_index(drop=True),
-                                syll[m].reset_index(drop=True),
-                                key[m].reset_index(drop=True))
-
-    def feats(df):
-        return [c for c in df.columns if c != "tot_name"]
-
-    ncol = _nv_col_order()
-    n_i, n_p, n_s = ncol[:38], ncol[38:59], ncol[59:66]
-    X = pd.concat([intens[n_i] if all(c in intens.columns for c in n_i)
-                   else intens[feats(intens)].reindex(columns=n_i),
-                   pause[n_p] if all(c in pause.columns for c in n_p)
-                   else pause[feats(pause)].reindex(columns=n_p),
-                   syll[n_s] if all(c in syll.columns for c in n_s)
-                   else syll[feats(syll)].reindex(columns=n_s)],
-                  axis=1).values.astype(np.float64)
-    Y = key.map(lambda k: byf[k]["label"]).to_numpy().astype(np.float64)
-    ag = key.map(lambda k: byf[k]["age"]).to_numpy().astype(np.float64)
-    sid = key.map(_it_subject).to_numpy()
-    ok = ~(np.isnan(X).any(axis=1) | np.isnan(ag))
-    return X[ok], Y[ok], ag[ok], sid[ok]
-
-def _it_subject(k):
-    s = str(k).rsplit("/", 1)[-1]
-    while s.endswith(".wav"):
-        s = s[:-4]
-    for t in IT_TASK_PREFIX:
-        if s.startswith(t):
-            s = s[len(t):]
-            break
-    s = re.sub(r"\d+$", "", s)
-    return s or str(k)
-
-def _u_axis(X_nv, X_tgt_all, y_nv):
-    nv_i = X_nv[:, INTENSITY_IDX]
-    stacked = np.vstack([nv_i, X_tgt_all[:, INTENSITY_IDX]])
-    zs = np.maximum(1e-12, stacked.std(0))
-    ns = (nv_i - stacked.mean(0)) / zs
-    mu2, comps = _pca_fit(ns, 5)
-    Z = _pca_apply(ns, (mu2, comps))
-    corrs = np.array([abs(np.corrcoef(Z[:, k], y_nv)[0, 1]) for k in range(5)])
-    k = int(np.argmin(corrs))
-    axis = (stacked.mean(0), zs, mu2, comps, k)
-    return Z[:, k], axis
-
-def _u_proj(X_t, axis):
-    stacked_mean, zs, mu2, comps, k = axis
-    ns = (X_t[:, INTENSITY_IDX] - stacked_mean) / zs
-    return _pca_apply(ns, (mu2, comps))[:, k]
-
-def _ratio(U_s, U_t):
-    if len(U_t) < 2 or np.std(U_t) < 1e-9 or np.std(U_s) < 1e-9:
-        return np.ones(len(U_s))
-    k_t, k_s = gaussian_kde(U_t), gaussian_kde(U_s)
-    r = k_t(U_s) / np.maximum(k_s(U_s), 1e-12)
-    lo, hi = np.percentile(r, 1), np.percentile(r, 99)
-    return np.clip(r, lo, hi)
-
-def _cb(X, y, ag):
-    W = np.asarray(ca.causal_weights(causal_graph=AGE_GRAPH, cause_var="y",
-                                     effect_var="X", fit_method=CB_FIT_METHOD,
-                                     X=X, y=y, Age=(ag, N_AGE_BINS)))
-    return W
-
-def _effect_vec(X, w1, w0):
-    s1, s0 = w1.sum(), w0.sum()
-    if s1 <= 0 or s0 <= 0:
-        return np.zeros(X.shape[1])
-    return (X * w1[:, None]).sum(0) / s1 - (X * w0[:, None]).sum(0) / s0
-
-def _local_effect(Xt, yt, age_t):
-    med = np.nanmedian(age_t)
-    a = np.where(np.isfinite(age_t), age_t, med) - med
-    mu, sd = Xt.mean(0), Xt.std(0)
-    sd = np.maximum(sd, np.median(sd) * 0.05)
-    Xz = (Xt - mu) / sd
-    A = np.column_stack([np.ones(len(yt)), yt, a])
-    return np.linalg.lstsq(A, Xz, rcond=None)[0][1]
-
-def _cluster_sel(units, rng):
-    u = np.unique(units)
-    return np.isin(units, rng.choice(u, size=len(u), replace=True))
-
-def _run_target(Xs, ys, ags, pids, Xt, yt, sidt, agt, r, rng, n_boot):
-    cb, raw, plac, loc = [], [], [], []
-    for _ in range(n_boot):
-        s = _cluster_sel(pids, rng)
-        W = _cb(Xs[s], ys[s], ags[s])
-        cb.append(_effect_vec(Xs[s], W[:, 1] * r[s], W[:, 0] * r[s]))
-        raw.append(_effect_vec(Xs[s], (ys[s] == 1).astype(float),
-                               (ys[s] == 0).astype(float)))
-        yp = rng.permutation(ys[s])
-        Wp = _cb(Xs[s], yp, ags[s])
-        plac.append(_effect_vec(Xs[s], Wp[:, 1], Wp[:, 0]))
-        th = _cluster_sel(sidt, rng)
-        loc.append(_local_effect(Xt[th], yt[th], agt[th]))
-    return dict(cb=np.array(cb), raw=np.array(raw),
-                plac=np.array(plac), loc=np.array(loc))
-
-GBC_PARAMS = dict(n_estimators=100, learning_rate=0.1, max_depth=3,
-                  min_child_weight=3, random_state=RANDOM_SEED, verbosity=0)
-CLF_CV_FOLDS = 3
-
 def _gbc(X, y, w=None):
-    clf = XGBClassifier(**GBC_PARAMS)
+    clf = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1,
+                                     max_depth=3, random_state=RANDOM_SEED)
     if w is not None:
         w = np.asarray(w, dtype=float)
         w = w * (len(X) / w.sum())
     clf.fit(np.asarray(X), y.astype(int), sample_weight=w)
     return clf
 
-def _metrics(y, prob):
-    y = np.asarray(y)
-    yi = y.astype(int)
-    pred = (np.asarray(prob) >= 0.5).astype(int)
-    acc = np.mean(pred == yi)
-    ba = _balanced_acc(yi, pred)
-    f1v = _f1_score(yi, pred)
-    auc = _roc_auc(yi, prob)
-    return acc, ba, f1v, auc
+def _cb(X, y, ag, sx, model="age", up=None, gr=None):
+    graph = GRAPH_MODELS[model]
+    if "X->y" in graph and "y->X" not in graph:
+        return np.ones((len(X), 2))
+    fit = CB_FIT_METHOD
+    kwargs = dict(causal_graph=graph, cause_var="y",
+                  effect_var="X", fit_method=fit,
+                  X=X, y=y, Age=(ag, N_AGE_BINS))
+    if "Sex" in graph:
+        if fit == "kde":
+            jit = np.random.default_rng(len(X)).uniform(-0.005, 0.005, len(sx))
+            sx = np.asarray(sx, dtype=float) + jit
+        kwargs["Sex"] = (sx, 2)
+    if "UPDRS" in graph:
+        u = np.asarray(up, dtype=float)
+        pd_mask = y == 1
+        u_pd_med = np.nanmedian(u[pd_mask]) if np.any(np.isfinite(u[pd_mask])) else 0.0
+        u = np.where(np.isnan(u), np.where(pd_mask, u_pd_med, 0.0), u)
+        kwargs["UPDRS"] = (u, len(UPDRS_EDGES) - 1)
+    if "GRBAS" in graph:
+        g = np.asarray(gr, dtype=float)
+        pd_mask = y == 1
+        g_pd_med = np.nanmedian(g[pd_mask]) if np.any(np.isfinite(g[pd_mask])) else 0.0
+        g = np.where(np.isnan(g), np.where(pd_mask, g_pd_med, 0.0), g)
+        kwargs["GRBAS"] = (g, len(GRBAS_EDGES) - 1)
+    return np.asarray(ca.causal_weights(**kwargs))
 
-def _fmt(m):
-    return str(round((m[0]), 2)) + '/' + str(round((m[1]), 2)) + '/' + str(round((m[2]), 2)) + '/' + str(round((m[3]), 2))
+def _tcb_weights(U_src, U_trg, Y_trg):
+    pu_src = gaussian_kde(U_src.ravel())(U_trg.ravel())
+    pu_trg = gaussian_kde(U_trg.ravel())(U_trg.ravel())
+    lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=5000, random_state=42)
+    lr.fit(U_trg.reshape(-1, 1), Y_trg.ravel())
+    py1 = lr.predict_proba(U_trg.reshape(-1, 1))[:, 1]
+    py_given_u = np.where(Y_trg.ravel() > 0.5, py1, 1 - py1)
+    w = pu_src / (pu_trg * py_given_u)
+    return w / np.mean(w)
 
-def _source_cv(Xs, ys, ws, folds=CLF_CV_FOLDS):
-    folds_idx = _strat_folds(ys, folds, RANDOM_SEED)
-    out = {}
-    for arm, w in (("raw", None), ("cb", ws)):
-        acc = []
-        for tr, te in folds_idx:
-            g = _gbc(Xs[tr], ys[tr], None if w is None else w[tr])
-            acc.append(_metrics(ys[te], g.predict_proba(Xs[te])[:, 1]))
-        out[arm] = np.mean(np.asarray(acc), axis=0)
-    return out
+def _loc_weights(X, y, age):
+    ag = np.asarray(age, dtype=float)
+    med = np.nanmedian(ag) if np.any(np.isfinite(ag)) else 0.0
+    ag = np.where(np.isfinite(ag), ag, med)
+    W = np.asarray(ca.causal_weights(causal_graph=AGE_GRAPH, cause_var="y",
+                                     effect_var="X", fit_method=CB_FIT_METHOD,
+                                     X=X, y=y, Age=(ag, N_AGE_BINS)))
+    return W
+
+def _w_backdoor(u, y):
+    u = np.asarray(u, dtype=float)
+    k_all = gaussian_kde(u)
+    p_all = k_all(u)
+    w = np.empty(len(u))
+    for c in (0, 1):
+        m = y == c
+        k_c = gaussian_kde(u[m])
+        w[m] = p_all[m] / np.maximum(k_c(u[m]), 1e-12)
+    return w * (len(u) / w.sum())
+
+def _synth_conf(X_pool, y_pool, quy, qyz, bright, seed_rand, seed_randn, frac=0.95):
+    rng_rand = np.random.default_rng(seed_rand)
+    rng_randn = np.random.default_rng(seed_randn)
+    N = X_pool.shape[0]
+    perm = rng_rand.permutation(N)
+    Xp, yp = X_pool[perm], y_pool[perm]
+    M = int(round(N * frac))
+    fstd = np.maximum(np.std(Xp, 0), 1e-12)
+
+    U = rng_randn.normal(0.0, 5.0, M)
+    q = np.log((1 - quy) / quy)
+    p_y = 1 / (1 + np.exp(q * U))
+    Y = (rng_rand.uniform(size=M) <= p_y).astype(int)
+
+    Z = np.where(rng_rand.uniform(size=M) > qyz, 1 - Y, Y)
+
+    idx = {c: np.where(yp == c)[0] for c in (0, 1)}
+    j = np.ones(2, dtype=int)
+    X = np.empty((M, Xp.shape[1]), dtype=np.float64)
+    for n in range(M):
+        g = Z[n]
+        cur = (j[g] - 1) % len(idx[g])
+        i = idx[g][cur]
+        j[g] += 1
+        X[n] = Xp[i] + (0.5 * np.tanh(0.2 * U[n]) + 0.5) * bright * fstd
+    return X, Y, Z, U
+
+def _speaker_split(sid, y, seed):
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(sid)
+    maj = np.array([np.bincount(y[sid == u].astype(int)).argmax() for u in uniq])
+    tr_u, te_u = [], []
+    for c in (0, 1):
+        idx = np.where(maj == c)[0]
+        p = rng.permutation(idx)
+        k = int(round(0.8 * len(p)))
+        tr_u += list(uniq[p[:k]].tolist())
+        te_u += list(uniq[p[k:]].tolist())
+    tr = np.isin(sid, np.asarray(tr_u))
+    te = np.isin(sid, np.asarray(te_u))
+    return tr, te
+
+def _ks_above(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return 1.0
+    if np.std(a) + np.std(b) == 0:
+        return 1.0
+    return ks_2samp(a, b, alternative="less").pvalue
 
 def main():
-    print("sID transportability check ...", flush=True)
-    try:
-        g = dsl.GraplDSL().readgrapl(SEL_DIAGRAM)
-        f = sid_alg.sid(Y={"X"}, X={"y"}, S={"S"}, D=g)
-        print("   P*(X|do(y)) =", None if f is None else f.rhs.tocondstr(),
-              flush=True)
-    except Exception as e:
-        print("   sID skipped:", type(e).__name__, e, flush=True)
-    print()
-
-    Xs, ys, ags, pids = load_nv()
+    X_raw, ys, ags, sxs, _, ups, grs = load_nv()
     if ags.size > 0:
         age_str = 'age [' + str(int(np.nanmin(ags))) + '-' + str(int(np.nanmax(ags))) + ']'
     else:
         age_str = 'age [no data]'
-    print('nv: ' + str(Xs.shape[0]) + ' recordings (' + str(int(ys.sum())) + ' pd / ' + str(len(ys) - int(ys.sum())) + ' hc), ' + age_str, flush=True)
+    print('nv: ' + str(X_raw.shape[0]) + ' recordings (' + str(int(ys.sum())) +
+          ' pd / ' + str(len(ys) - int(ys.sum())) + ' hc), ' + age_str, flush=True)
 
-    mu_s, sd_s = Xs.mean(0), Xs.std(0)
+    mu_s, sd_s = X_raw.mean(0), X_raw.std(0)
     sd_s = np.maximum(sd_s, np.median(sd_s) * 0.05)
-    Xs = (Xs - mu_s) / sd_s
+    Xs = (X_raw - mu_s) / sd_s
+
+    print()
+    print("step 1: semi-synthetic confounder verification (simulated U)")
+    sc = _SS().fit(X_raw)
+    Xc = sc.transform(X_raw)
+    tr_conf = _synth_conf(Xc, ys, SYNTH_QY_CONF, SYNTH_QYZ, SYNTH_BRIGHT, 1, 101)
+    tr_unconf = _synth_conf(Xc, ys, SYNTH_QY_UNCONF, SYNTH_QYZ, SYNTH_BRIGHT, 2, 202)
+    tr_rev = _synth_conf(Xc, ys, SYNTH_QY_REV, SYNTH_QYZ, SYNTH_BRIGHT, 5, 505)
+    te_conf = _synth_conf(Xc, ys, SYNTH_QY_CONF, SYNTH_QYZ, SYNTH_BRIGHT, 3, 303)
+    te_unconf = _synth_conf(Xc, ys, SYNTH_QY_UNCONF, SYNTH_QYZ, SYNTH_BRIGHT, 4, 404)
+
+    w_dec = _w_backdoor(tr_conf[3], tr_conf[1])
+    w_dec_r = _w_backdoor(tr_rev[3], tr_rev[1])
+    mods = {
+        "confounded": _gbc(tr_conf[0], tr_conf[1]),
+        "deconfounded": _gbc(tr_conf[0], tr_conf[1], w_dec),
+        "unconf-trained": _gbc(tr_unconf[0], tr_unconf[1]),
+        "confounded (reverse)": _gbc(tr_rev[0], tr_rev[1]),
+        "deconfounded (reverse)": _gbc(tr_rev[0], tr_rev[1], w_dec_r),
+    }
+    print(f"{'model':>22}  {'conf-test acc':>14} {'conf-test ba':>14}  "
+          f"{'unconf-test acc':>15} {'unconf-test ba':>15}")
+    for name, g in mods.items():
+        m1 = _metrics(te_conf[1], g.predict_proba(te_conf[0])[:, 1])
+        m2 = _metrics(te_unconf[1], g.predict_proba(te_unconf[0])[:, 1])
+        print(f"{name:>22}  {m1[0]:>12.4f} {m1[1]:>12.4f}  "
+              f"{m2[0]:>13.4f} {m2[1]:>13.4f}", flush=True)
 
     pc = load_pc()
-    it = load_italian()
-    zt = lambda X: (np.asarray(X, dtype=float) - mu_s) / sd_s
-    itm = ~np.isnan(it[0]).any(axis=1) & np.isfinite(it[2])
-    targets = {"ITALIAN": (zt(it[0][itm]), it[1][itm], it[3][itm], it[2][itm])}
-    for name, (X, y, s, a) in pc.items():
-        m = ~np.isnan(X).any(axis=1)
-        targets[name.upper()] = (zt(X[m]), y[m], s[m], a[m])
+    print()
+    print("step 2: causal transportability NV -> PC (speaker-level split)")
 
-    Zfull = Xs
-    pool = np.vstack([zt(pc[k][0]) for k in pc])
-    sep = np.array([_corp_sep(Zfull[:, f], pool[:, f]) for f in range(N_FEAT)])
-    keep = sep <= CORPUS_SEP_MAX
-    Xs = Zfull[:, keep]
-    cols = _nv_col_order()
-    top = [cols[i] for i in np.argsort(sep)[-6:][::-1]]
-    print('corpus-sep audit: kept ' + str(int(keep.sum())) + '/' + str(N_FEAT) + ' features (threshold ' + str(CORPUS_SEP_MAX) + '); most corpus-separated: ' + str(', '.join(top)),
-          flush=True)
+    pca = PCA(n_components=5)
+    L_nv = pca.fit_transform(Xs[:, INTENSITY_IDX])
+    corrs_u = np.array([abs(np.corrcoef(L_nv[:, i], ys)[0, 1]) for i in range(5)])
+    k_u = int(np.argmin(corrs_u))
+    U_nv = L_nv[:, k_u]
+    print(f"   U = PC{k_u + 1} of nv intensity block (|r(Y)|={corrs_u[k_u]:.3f})")
 
-    U_nv, uaxis = _u_axis(Zfull, pool, ys)
-    print('u = pc' + str(uaxis[4] + 1) + ' of nv intensity block (min-|corr| with y)',
-          flush=True)
+    arms = ["standard", "localized", "tcb"]
+    for name, (X_pc, y_pc, sid_pc, age_pc) in pc.items():
+        m0 = ~np.isnan(X_pc).any(axis=1)
+        X_pc, y_pc, sid_pc, age_pc = X_pc[m0], y_pc[m0], sid_pc[m0], age_pc[m0]
+        if len(np.unique(sid_pc)) < 4:
+            print(f"\n--- {name}: only {len(np.unique(sid_pc))} speakers, skipped ---")
+            continue
+        res = {k: [] for k in arms}
+        for rep in range(N_REPS):
+            seed = RANDOM_SEED + rep
+            tr, te = _speaker_split(sid_pc, y_pc, seed)
+            if tr.sum() == 0 or te.sum() == 0:
+                continue
+            sc_pc = _SS().fit(X_pc[tr])
+            X_tr, X_te = sc_pc.transform(X_pc[tr]), sc_pc.transform(X_pc[te])
+            y_tr, y_te = y_pc[tr], y_pc[te]
+            U_pc_tr = pca.transform(X_tr[:, INTENSITY_IDX])[:, k_u]
+            w_loc = _loc_weights(X_tr, y_tr, age_pc[tr])
+            w_loc = w_loc[np.arange(len(y_tr)), y_tr.astype(int)]
+            w_tcb = _tcb_weights(U_nv, U_pc_tr, y_tr)
+            g_std = _gbc(X_tr, y_tr)
+            g_loc = _gbc(X_tr, y_tr, w_loc)
+            g_tcb = _gbc(X_tr, y_tr, w_tcb)
+            res["standard"].append(_metrics(y_te, g_std.predict_proba(X_te)[:, 1]))
+            res["localized"].append(_metrics(y_te, g_loc.predict_proba(X_te)[:, 1]))
+            res["tcb"].append(_metrics(y_te, g_tcb.predict_proba(X_te)[:, 1]))
 
-    rng = np.random.RandomState(RANDOM_SEED)
-    hdr = (str('target') + str('n') + str('|tau| cb') + str('95% CI') + str('|tau| raw') + str('|tau| plac') + str('|tau| loc') + str('frac>0') + str('agr'))
-    print(hdr)
-
-    gates = []
-    for name, (Xt, yt, sidt, agt) in targets.items():
-        n_clips, n_spk = len(yt), int(np.unique(sidt).size)
-        U_pc = _u_proj(Xt, uaxis)
-        r = _ratio(U_nv, U_pc)
-        Xc = Xt[:, keep]
-
-        B = _run_target(Xs, ys, ags, pids, Xc, yt, sidt, agt, r, rng, N_BOOT)
-        cb, raw, plac, loc = B["cb"], B["raw"], B["plac"], B["loc"]
-        rm = lambda a: np.sqrt(np.mean(a ** 2, axis=1))
-        crm, rrm, prm, lrm = rm(cb), rm(raw), rm(plac), rm(loc)
-        lo, hi = np.percentile(crm, 2.5), np.percentile(crm, 97.5)
-
-        W_all = _cb(Xs, ys, ags)
-        cb_pt = _effect_vec(Xs, W_all[:, 1] * r, W_all[:, 0] * r)
-        loc_pt = _local_effect(Xc, yt, agt)
-        agr = _sign_agr(cb_pt, loc_pt)
-
-        lo_f = np.percentile(cb, 2.5, axis=0)
-        hi_f = np.percentile(cb, 97.5, axis=0)
-        frac0 = float(np.mean((lo_f > 0) | (hi_f < 0)))
-
-        dd = crm - rrm
-        pval = 1.0
-        if np.any(dd) and len(np.unique(dd)) > 1:
-            try:
-                _, pval = wilcoxon(dd)
-            except ValueError:
-                pval = 1.0
-
-        print(str(name) + ' ' + str(n_clips) + ' ' + str(np.median(crm)) + '[' + str(lo) + ',' + str(hi) + ']' + str(np.median(rrm)) + str(np.median(prm)) + str(np.median(lrm)) + str(frac0) + str(agr), flush=True)
-        gates.append(dict(target=name, lo=lo, hi=hi, agr=agr,
-                          p_deconf=pval, plac=np.median(prm)))
+        print(f"\n--- {name}: n={len(y_pc)}, speakers={len(np.unique(sid_pc))}, "
+              f"reps={N_REPS} ---")
+        hdr = (f"{'method':>14}  " +
+               "  ".join(f"{m:>19}" for m in ("acc", "ba", "f1", "auc")) +
+               "  " + f"{'ks_ba':>9}" + "  " + f"{'diff_ci':>20}")
+        print(hdr)
+        for key, label in (("standard", "Standard"),
+                           ("localized", "Localised (PC)"),
+                           ("tcb", "TCB (NV->PC)")):
+            a = np.asarray(res[key])
+            row = "  ".join(f"{_nan_mean(a[:, k]):>9.4f}±{_nan_std(a[:, k]):.4f}"
+                            for k in range(4))
+            if key == "standard":
+                print(f"{label:>14}  {row}")
+            else:
+                ref = np.asarray(res["standard"])
+                d = a[:, 1] - ref[:, 1]
+                d = d[np.isfinite(d)]
+                lo, hi = np.percentile(d, 2.5), np.percentile(d, 97.5)
+                p_ba = _ks_above(a[:, 1], ref[:, 1])
+                print(f"{label:>14}  {row}  {p_ba:>9.4f}  "
+                      f"[{lo:.4f}, {hi:.4f}]")
 
     print()
-    print("Gates (pre-committed in tests/gates.txt):")
-    n1 = sum(1 for g in gates if g["lo"] > 0)
-    n2 = sum(1 for g in gates if g["agr"] >= 0.5)
-    n3 = sum(1 for g in gates if g["p_deconf"] < 0.05)
-    n4 = sum(1 for g in gates if g["plac"] < 0.25 * max(0.01, g["lo"]))
-    print(' g1 |tau|_cb 95%-ci lower > 0 on ' + str(n1) + '/' + str(len(gates)) + ' targets')
-    print(' g2 sign agreement cb vs localized >= .5 on ' + str(n2) + '/' + str(len(gates)) + ' targets')
-    print(' g3 cb differs from raw assoc (p<.05) on ' + str(n3) + '/' + str(len(gates)) + ' targets')
-    print(' g4 placebo |tau| < .25*cb lower-ci on ' + str(n4) + '/' + str(len(gates)) + ' targets')
-
-    W_all = _cb(Xs, ys, ags)
-    w_cb = W_all[np.arange(len(ys)), ys.astype(int)]
-    cvr = _source_cv(Xs, ys, w_cb)
-    print()
-    print("Predictive transfer (§5.3 GBC  acc / BA / F1 / AUC @ 0.5 thr):")
-    print(str('source-cv') + ' ' + str(len(ys)) + ' ' + ' raw ' + str(_fmt(cvr['raw'])) + ' cb ' + str(_fmt(cvr['cb'])) + ' plac n/a')
-    yp = rng.permutation(ys)
-    gb = {"raw": _gbc(Xs, ys),
-          "cb": _gbc(Xs, ys, w_cb),
-          "plac": _gbc(Xs, yp)}
-    print(str('target') + ' ' + str('n') + ' ' + ' ' + str('raw') + ' ' + ' ' + str('cb') + ' ' + ' ' + str('plac') + ' ')
-    for name, (Xt, yt, sidt, agt) in targets.items():
-        Xc = Xt[:, keep]
-        row = []
-        for arm in ("raw", "cb", "plac"):
-            row.append(_fmt(_metrics(yt, gb[arm].predict_proba(Xc)[:, 1])))
-        print(str(name) + ' ' + str(len(yt)) + ' ' + ' ' + str(row[0]) + ' ' + ' ' + str(row[1]) + ' ' + ' ' + str(row[2]) + ' ')
+    print("step 2b: CB-NV source-deconfounded GBC trained on NeuroVoz, evaluated on PC directly")
+    for model in GRAPH_MODELS:
+        W = _cb(Xs, ys, ags, sxs, model=model, up=ups, gr=grs)
+        w_cb = W[np.arange(len(ys)), ys.astype(int)]
+        g_cb = _gbc(Xs, ys, w_cb)
+        g_raw = _gbc(Xs, ys)
+        for name, (X_pc, y_pc, _, _) in pc.items():
+            m0 = ~np.isnan(X_pc).any(axis=1)
+            Xt = (X_pc[m0] - mu_s) / sd_s
+            yt = y_pc[m0]
+            mc = _metrics(yt, g_cb.predict_proba(Xt)[:, 1])
+            mr = _metrics(yt, g_raw.predict_proba(Xt)[:, 1])
+            print(f"{model:>9} {name:>6}  " +
+                  " ".join(f"{mc[k]:.4f}/{mr[k]:.4f}" for k in (0, 1, 2, 3)),
+                  flush=True)
 
 if __name__ == "__main__":
     main()
