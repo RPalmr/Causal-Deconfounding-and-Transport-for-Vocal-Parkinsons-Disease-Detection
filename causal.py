@@ -251,6 +251,12 @@ def _cb(X, y, ag, sx, model="age", up=None, gr=None):
     return np.asarray(ca.causal_weights(**kwargs))
 
 def _tcb_weights(U_src, U_trg, Y_trg):
+    U_src = np.asarray(U_src, dtype=float)
+    U_trg = np.asarray(U_trg, dtype=float)
+    if U_src.ndim == 1:
+        U_src = U_src[:, None]
+    if U_trg.ndim == 1:
+        U_trg = U_trg[:, None]
     pu_src = np.asarray(gaussian_kde(U_src.T)(U_trg.T)).ravel()
     pu_trg = np.asarray(gaussian_kde(U_trg.T)(U_trg.T)).ravel()
     lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=5000, random_state=42)
@@ -335,6 +341,56 @@ def _perm_gt(a, b, n_flip=10000, seed=7):
     null = (d[None, :] * (2 * flips - 1)).mean(axis=1)
     return float((null >= obs).mean())
 
+def _eval_pc(X_pc, y_pc, sid_pc, age_pc, U_nv, pca, k_u, label):
+    m0 = ~np.isnan(X_pc).any(axis=1)
+    X_pc, y_pc, sid_pc, age_pc = X_pc[m0], y_pc[m0], sid_pc[m0], age_pc[m0]
+    if len(np.unique(sid_pc)) < 4:
+        print(f"\n--- {label}: only {len(np.unique(sid_pc))} speakers, skipped ---")
+        return
+    arms = ["standard", "localized", "tcb"]
+    res = {k: [] for k in arms}
+    for rep in range(N_REPS):
+        seed = RANDOM_SEED + rep
+        tr, te = _speaker_split(sid_pc, y_pc, seed)
+        if tr.sum() == 0 or te.sum() == 0:
+            continue
+        sc_pc = _SS().fit(X_pc[tr])
+        X_tr, X_te = sc_pc.transform(X_pc[tr]), sc_pc.transform(X_pc[te])
+        y_tr, y_te = y_pc[tr], y_pc[te]
+        U_pc_tr = pca.transform(X_tr[:, INTENSITY_IDX])[:, k_u]
+        w_loc = _loc_weights(X_tr, y_tr, age_pc[tr])
+        w_loc = w_loc[np.arange(len(y_tr)), y_tr.astype(int)]
+        w_tcb = _tcb_weights(U_nv, U_pc_tr, y_tr)
+        g_std = _gbc(X_tr, y_tr)
+        g_loc = _gbc(X_tr, y_tr, w_loc)
+        g_tcb = _gbc(X_tr, y_tr, w_tcb)
+        res["standard"].append(_metrics(y_te, g_std.predict_proba(X_te)[:, 1]))
+        res["localized"].append(_metrics(y_te, g_loc.predict_proba(X_te)[:, 1]))
+        res["tcb"].append(_metrics(y_te, g_tcb.predict_proba(X_te)[:, 1]))
+
+    print(f"\n--- {label}: n={len(y_pc)}, speakers={len(np.unique(sid_pc))}, "
+          f"reps={N_REPS} ---")
+    hdr = (f"{'method':>14}  " +
+           "  ".join(f"{m:>19}" for m in ("acc", "ba", "f1", "auc")) +
+           "  " + f"{'p_pair':>9}" + "  " + f"{'diff_ci':>20}")
+    print(hdr)
+    for key, label in (("standard", "Standard"),
+                       ("localized", "Localised (PC)"),
+                       ("tcb", "TCB (NV->PC)")):
+        a = np.asarray(res[key])
+        row = "  ".join(f"{_nan_mean(a[:, k]):>9.4f}±{_nan_std(a[:, k]):.4f}"
+                        for k in range(4))
+        if key == "standard":
+            print(f"{label:>14}  {row}")
+        else:
+            ref = np.asarray(res["standard"])
+            d = a[:, 1] - ref[:, 1]
+            d = d[np.isfinite(d)]
+            lo, hi = np.percentile(d, 2.5), np.percentile(d, 97.5)
+            p_pair = _perm_gt(a[:, 1], ref[:, 1])
+            print(f"{label:>14}  {row}  {p_pair:>9.4f}  "
+                  f"[{lo:.4f}, {hi:.4f}]")
+
 def main():
     X_raw, ys, ags, sxs, _, ups, grs = load_nv()
     if ags.size > 0:
@@ -390,55 +446,8 @@ def main():
     print("   U = PCs " + str(k_u + 1) + " of nv intensity block (|r(Y)| <= %.3f)"
           % corrs_u[k_u].max())
 
-    arms = ["standard", "localized", "tcb"]
     for name, (X_pc, y_pc, sid_pc, age_pc) in pc.items():
-        m0 = ~np.isnan(X_pc).any(axis=1)
-        X_pc, y_pc, sid_pc, age_pc = X_pc[m0], y_pc[m0], sid_pc[m0], age_pc[m0]
-        if len(np.unique(sid_pc)) < 4:
-            print(f"\n--- {name}: only {len(np.unique(sid_pc))} speakers, skipped ---")
-            continue
-        res = {k: [] for k in arms}
-        for rep in range(N_REPS):
-            seed = RANDOM_SEED + rep
-            tr, te = _speaker_split(sid_pc, y_pc, seed)
-            if tr.sum() == 0 or te.sum() == 0:
-                continue
-            sc_pc = _SS().fit(X_pc[tr])
-            X_tr, X_te = sc_pc.transform(X_pc[tr]), sc_pc.transform(X_pc[te])
-            y_tr, y_te = y_pc[tr], y_pc[te]
-            U_pc_tr = pca.transform(X_tr[:, INTENSITY_IDX])[:, k_u]
-            w_loc = _loc_weights(X_tr, y_tr, age_pc[tr])
-            w_loc = w_loc[np.arange(len(y_tr)), y_tr.astype(int)]
-            w_tcb = _tcb_weights(U_nv, U_pc_tr, y_tr)
-            g_std = _gbc(X_tr, y_tr)
-            g_loc = _gbc(X_tr, y_tr, w_loc)
-            g_tcb = _gbc(X_tr, y_tr, w_tcb)
-            res["standard"].append(_metrics(y_te, g_std.predict_proba(X_te)[:, 1]))
-            res["localized"].append(_metrics(y_te, g_loc.predict_proba(X_te)[:, 1]))
-            res["tcb"].append(_metrics(y_te, g_tcb.predict_proba(X_te)[:, 1]))
-
-        print(f"\n--- {name}: n={len(y_pc)}, speakers={len(np.unique(sid_pc))}, "
-              f"reps={N_REPS} ---")
-        hdr = (f"{'method':>14}  " +
-               "  ".join(f"{m:>19}" for m in ("acc", "ba", "f1", "auc")) +
-               "  " + f"{'p_pair':>9}" + "  " + f"{'diff_ci':>20}")
-        print(hdr)
-        for key, label in (("standard", "Standard"),
-                           ("localized", "Localised (PC)"),
-                           ("tcb", "TCB (NV->PC)")):
-            a = np.asarray(res[key])
-            row = "  ".join(f"{_nan_mean(a[:, k]):>9.4f}±{_nan_std(a[:, k]):.4f}"
-                            for k in range(4))
-            if key == "standard":
-                print(f"{label:>14}  {row}")
-            else:
-                ref = np.asarray(res["standard"])
-                d = a[:, 1] - ref[:, 1]
-                d = d[np.isfinite(d)]
-                lo, hi = np.percentile(d, 2.5), np.percentile(d, 97.5)
-                p_pair = _perm_gt(a[:, 1], ref[:, 1])
-                print(f"{label:>14}  {row}  {p_pair:>9.4f}  "
-                      f"[{lo:.4f}, {hi:.4f}]")
+        _eval_pc(X_pc, y_pc, sid_pc, age_pc, U_nv, pca, k_u, name)
 
     print()
     print("step 2b: CB-NV source-deconfounded GBC trained on NeuroVoz, evaluated on PC directly")
