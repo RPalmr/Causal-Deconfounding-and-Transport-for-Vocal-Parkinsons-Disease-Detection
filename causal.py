@@ -397,18 +397,6 @@ def main():
     print("   U = PCs " + str(k_u + 1) + " of nv intensity block (|r(Y)| <= %.3f)"
           % corrs_u[k_u].max())
 
-    pd_u = np.isfinite(ups) & (ys == 1)
-    mild = (ys == 0) | (pd_u & (ups <= np.nanmedian(ups[pd_u])))
-    pca_m = PCA(n_components=5)
-    L_m = pca_m.fit_transform(Xs[mild][:, INTENSITY_IDX])
-    corrs_m = np.array([abs(np.corrcoef(L_m[:, i], ys[mild])[0, 1])
-                        for i in range(5)])
-    k_m = np.argsort(corrs_m)[:U_DIMS]
-    U_mild = L_m[:, k_m]
-    print("   U(mild) = PCs " + str(k_m + 1) +
-          " of nv intensity block, low-UPDRS PD + HC (|r(Y)| <= %.3f)"
-          % corrs_m[k_m].max())
-
     sel = _select_features(Xs, ys)
     print("   features: top %d by ExtraTrees importance on NV (of %d)"
           % (len(sel), Xs.shape[1]))
@@ -431,11 +419,7 @@ def main():
                 sc_pc.transform(X_pc[te])
             X_tr, X_te = X_tr_full[:, sel], X_te_full[:, sel]
             y_tr, y_te = y_pc[tr], y_pc[te]
-            prodromal = name in ("-2", "-1")
-            pca_r = pca_m if prodromal else pca
-            k_r = k_m if prodromal else k_u
-            U_ref = U_mild if prodromal else U_nv
-            U_pc_tr = pca_r.transform(X_tr_full[:, INTENSITY_IDX])[:, k_r]
+            U_pc_tr = pca.transform(X_tr_full[:, INTENSITY_IDX])[:, k_u]
             w_loc = _loc_weights(X_tr, y_tr, age_pc[tr])
             w_loc = w_loc[np.arange(len(y_tr)), y_tr.astype(int)]
             w_tcb = _tcb_weights(U_ref, U_pc_tr, y_tr)
