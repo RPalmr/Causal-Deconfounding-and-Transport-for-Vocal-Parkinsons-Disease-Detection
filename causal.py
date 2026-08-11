@@ -11,7 +11,7 @@ for p in [str(BASE) + '/libraries/CausalBootstrapping', str(BASE) + '/libraries/
 
 import causal_assistant as ca
 from scipy.stats import gaussian_kde
-from sklearn.ensemble import GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler as _SS
@@ -21,7 +21,6 @@ import transport_u_age as age
 RANDOM_SEED = 42
 N_REPS = 200
 U_DIMS = 2
-N_SELECT = 30
 N_AGE_BINS = 6
 CB_FIT_METHOD = "kde"
 META_COLS = {"Unnamed: 0", "tot_name"}
@@ -323,12 +322,6 @@ def _speaker_split(sid, y, seed):
     te = np.isin(sid, np.asarray(te_u))
     return tr, te
 
-def _select_features(Xs, ys):
-    et = ExtraTreesClassifier(n_estimators=200, max_depth=10,
-                              random_state=RANDOM_SEED, n_jobs=-1)
-    et.fit(Xs, ys)
-    return np.argsort(et.feature_importances_)[::-1][:N_SELECT]
-
 def _perm_gt(a, b, n_flip=10000, seed=7):
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -397,10 +390,6 @@ def main():
     print("   U = PCs " + str(k_u + 1) + " of nv intensity block (|r(Y)| <= %.3f)"
           % corrs_u[k_u].max())
 
-    sel = _select_features(Xs, ys)
-    print("   features: top %d by ExtraTrees importance on NV (of %d)"
-          % (len(sel), Xs.shape[1]))
-
     arms = ["standard", "localized", "tcb"]
     for name, (X_pc, y_pc, sid_pc, age_pc) in pc.items():
         m0 = ~np.isnan(X_pc).any(axis=1)
@@ -415,11 +404,9 @@ def main():
             if tr.sum() == 0 or te.sum() == 0:
                 continue
             sc_pc = _SS().fit(X_pc[tr])
-            X_tr_full, X_te_full = sc_pc.transform(X_pc[tr]), \
-                sc_pc.transform(X_pc[te])
-            X_tr, X_te = X_tr_full[:, sel], X_te_full[:, sel]
+            X_tr, X_te = sc_pc.transform(X_pc[tr]), sc_pc.transform(X_pc[te])
             y_tr, y_te = y_pc[tr], y_pc[te]
-            U_pc_tr = pca.transform(X_tr_full[:, INTENSITY_IDX])[:, k_u]
+            U_pc_tr = pca.transform(X_tr[:, INTENSITY_IDX])[:, k_u]
             w_loc = _loc_weights(X_tr, y_tr, age_pc[tr])
             w_loc = w_loc[np.arange(len(y_tr)), y_tr.astype(int)]
             w_tcb = _tcb_weights(U_nv, U_pc_tr, y_tr)
@@ -455,15 +442,14 @@ def main():
 
     print()
     print("step 2b: CB-NV source-deconfounded GBC trained on NeuroVoz, evaluated on PC directly")
-    Xs_s = Xs[:, sel]
     for model in GRAPH_MODELS:
         W = _cb(Xs, ys, ags, sxs, model=model, up=ups, gr=grs)
         w_cb = W[np.arange(len(ys)), ys.astype(int)]
-        g_cb = _gbc(Xs_s, ys, w_cb)
-        g_raw = _gbc(Xs_s, ys)
+        g_cb = _gbc(Xs, ys, w_cb)
+        g_raw = _gbc(Xs, ys)
         for name, (X_pc, y_pc, _, _) in pc.items():
             m0 = ~np.isnan(X_pc).any(axis=1)
-            Xt = (X_pc[m0][:, sel] - mu_s[sel]) / sd_s[sel]
+            Xt = (X_pc[m0] - mu_s) / sd_s
             yt = y_pc[m0]
             mc = _metrics(yt, g_cb.predict_proba(Xt)[:, 1])
             mr = _metrics(yt, g_raw.predict_proba(Xt)[:, 1])
