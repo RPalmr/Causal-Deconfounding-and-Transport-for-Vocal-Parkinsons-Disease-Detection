@@ -10,8 +10,8 @@ for p in [str(BASE) + '/libraries/CausalBootstrapping', str(BASE) + '/libraries/
         sys.path.insert(0, p)
 
 import causal_assistant as ca
-from scipy.stats import gaussian_kde, ks_2samp
-from sklearn.ensemble import GradientBoostingClassifier
+from scipy.stats import gaussian_kde
+from sklearn.ensemble import GradientBoostingClassifier, ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler as _SS
@@ -20,6 +20,8 @@ import transport_u_age as age
 
 RANDOM_SEED = 42
 N_REPS = 200
+U_DIMS = 2
+N_SELECT = 30
 N_AGE_BINS = 6
 CB_FIT_METHOD = "kde"
 META_COLS = {"Unnamed: 0", "tot_name"}
@@ -250,11 +252,11 @@ def _cb(X, y, ag, sx, model="age", up=None, gr=None):
     return np.asarray(ca.causal_weights(**kwargs))
 
 def _tcb_weights(U_src, U_trg, Y_trg):
-    pu_src = gaussian_kde(U_src.ravel())(U_trg.ravel())
-    pu_trg = gaussian_kde(U_trg.ravel())(U_trg.ravel())
+    pu_src = np.asarray(gaussian_kde(U_src.T)(U_trg.T)).ravel()
+    pu_trg = np.asarray(gaussian_kde(U_trg.T)(U_trg.T)).ravel()
     lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=5000, random_state=42)
-    lr.fit(U_trg.reshape(-1, 1), Y_trg.ravel())
-    py1 = lr.predict_proba(U_trg.reshape(-1, 1))[:, 1]
+    lr.fit(U_trg, Y_trg.ravel())
+    py1 = lr.predict_proba(U_trg)[:, 1]
     py_given_u = np.where(Y_trg.ravel() > 0.5, py1, 1 - py1)
     w = pu_src / (pu_trg * py_given_u)
     return w / np.mean(w)
@@ -321,14 +323,24 @@ def _speaker_split(sid, y, seed):
     te = np.isin(sid, np.asarray(te_u))
     return tr, te
 
-def _ks_above(a, b):
+def _select_features(Xs, ys):
+    et = ExtraTreesClassifier(n_estimators=200, max_depth=10,
+                              random_state=RANDOM_SEED, n_jobs=-1)
+    et.fit(Xs, ys)
+    return np.argsort(et.feature_importances_)[::-1][:N_SELECT]
+
+def _perm_gt(a, b, n_flip=10000, seed=7):
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
-    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+    d = a - b
+    d = d[np.isfinite(d)]
+    if len(d) < 3 or np.std(d) == 0:
         return 1.0
-    if np.std(a) + np.std(b) == 0:
-        return 1.0
-    return ks_2samp(a, b, alternative="less").pvalue
+    rng = np.random.default_rng(seed)
+    obs = d.mean()
+    flips = rng.integers(0, 2, size=(n_flip, len(d)), dtype=np.int8)
+    null = (d[None, :] * (2 * flips - 1)).mean(axis=1)
+    return float((null >= obs).mean())
 
 def main():
     X_raw, ys, ags, sxs, _, ups, grs = load_nv()
@@ -350,17 +362,20 @@ def main():
     tr_conf = _synth_conf(Xc, ys, SYNTH_QY_CONF, SYNTH_QYZ, SYNTH_BRIGHT, 1, 101)
     tr_unconf = _synth_conf(Xc, ys, SYNTH_QY_UNCONF, SYNTH_QYZ, SYNTH_BRIGHT, 2, 202)
     tr_rev = _synth_conf(Xc, ys, SYNTH_QY_REV, SYNTH_QYZ, SYNTH_BRIGHT, 5, 505)
+    tr_proj = _synth_conf(Xc, ys, SYNTH_QY_CONF, SYNTH_QYZ, 0.0, 6, 606)
     te_conf = _synth_conf(Xc, ys, SYNTH_QY_CONF, SYNTH_QYZ, SYNTH_BRIGHT, 3, 303)
     te_unconf = _synth_conf(Xc, ys, SYNTH_QY_UNCONF, SYNTH_QYZ, SYNTH_BRIGHT, 4, 404)
 
     w_dec = _w_backdoor(tr_conf[3], tr_conf[1])
     w_dec_r = _w_backdoor(tr_rev[3], tr_rev[1])
+    w_proj = _w_backdoor(tr_proj[3], tr_proj[1])
     mods = {
         "confounded": _gbc(tr_conf[0], tr_conf[1]),
         "deconfounded": _gbc(tr_conf[0], tr_conf[1], w_dec),
         "unconf-trained": _gbc(tr_unconf[0], tr_unconf[1]),
         "confounded (reverse)": _gbc(tr_rev[0], tr_rev[1]),
         "deconfounded (reverse)": _gbc(tr_rev[0], tr_rev[1], w_dec_r),
+        "deconfounded (U-proj)": _gbc(tr_proj[0], tr_proj[1], w_proj),
     }
     print(f"{'model':>22}  {'conf-test acc':>14} {'conf-test ba':>14}  "
           f"{'unconf-test acc':>15} {'unconf-test ba':>15}")
@@ -377,9 +392,26 @@ def main():
     pca = PCA(n_components=5)
     L_nv = pca.fit_transform(Xs[:, INTENSITY_IDX])
     corrs_u = np.array([abs(np.corrcoef(L_nv[:, i], ys)[0, 1]) for i in range(5)])
-    k_u = int(np.argmin(corrs_u))
+    k_u = np.argsort(corrs_u)[:U_DIMS]
     U_nv = L_nv[:, k_u]
-    print(f"   U = PC{k_u + 1} of nv intensity block (|r(Y)|={corrs_u[k_u]:.3f})")
+    print("   U = PCs " + str(k_u + 1) + " of nv intensity block (|r(Y)| <= %.3f)"
+          % corrs_u[k_u].max())
+
+    pd_u = np.isfinite(ups) & (ys == 1)
+    mild = (ys == 0) | (pd_u & (ups <= np.nanmedian(ups[pd_u])))
+    pca_m = PCA(n_components=5)
+    L_m = pca_m.fit_transform(Xs[mild][:, INTENSITY_IDX])
+    corrs_m = np.array([abs(np.corrcoef(L_m[:, i], ys[mild])[0, 1])
+                        for i in range(5)])
+    k_m = np.argsort(corrs_m)[:U_DIMS]
+    U_mild = L_m[:, k_m]
+    print("   U(mild) = PCs " + str(k_m + 1) +
+          " of nv intensity block, low-UPDRS PD + HC (|r(Y)| <= %.3f)"
+          % corrs_m[k_m].max())
+
+    sel = _select_features(Xs, ys)
+    print("   features: top %d by ExtraTrees importance on NV (of %d)"
+          % (len(sel), Xs.shape[1]))
 
     arms = ["standard", "localized", "tcb"]
     for name, (X_pc, y_pc, sid_pc, age_pc) in pc.items():
@@ -395,12 +427,18 @@ def main():
             if tr.sum() == 0 or te.sum() == 0:
                 continue
             sc_pc = _SS().fit(X_pc[tr])
-            X_tr, X_te = sc_pc.transform(X_pc[tr]), sc_pc.transform(X_pc[te])
+            X_tr_full, X_te_full = sc_pc.transform(X_pc[tr]), \
+                sc_pc.transform(X_pc[te])
+            X_tr, X_te = X_tr_full[:, sel], X_te_full[:, sel]
             y_tr, y_te = y_pc[tr], y_pc[te]
-            U_pc_tr = pca.transform(X_tr[:, INTENSITY_IDX])[:, k_u]
+            prodromal = name in ("-2", "-1")
+            pca_r = pca_m if prodromal else pca
+            k_r = k_m if prodromal else k_u
+            U_ref = U_mild if prodromal else U_nv
+            U_pc_tr = pca_r.transform(X_tr_full[:, INTENSITY_IDX])[:, k_r]
             w_loc = _loc_weights(X_tr, y_tr, age_pc[tr])
             w_loc = w_loc[np.arange(len(y_tr)), y_tr.astype(int)]
-            w_tcb = _tcb_weights(U_nv, U_pc_tr, y_tr)
+            w_tcb = _tcb_weights(U_ref, U_pc_tr, y_tr)
             g_std = _gbc(X_tr, y_tr)
             g_loc = _gbc(X_tr, y_tr, w_loc)
             g_tcb = _gbc(X_tr, y_tr, w_tcb)
@@ -412,7 +450,7 @@ def main():
               f"reps={N_REPS} ---")
         hdr = (f"{'method':>14}  " +
                "  ".join(f"{m:>19}" for m in ("acc", "ba", "f1", "auc")) +
-               "  " + f"{'ks_ba':>9}" + "  " + f"{'diff_ci':>20}")
+               "  " + f"{'p_pair':>9}" + "  " + f"{'diff_ci':>20}")
         print(hdr)
         for key, label in (("standard", "Standard"),
                            ("localized", "Localised (PC)"),
@@ -427,20 +465,21 @@ def main():
                 d = a[:, 1] - ref[:, 1]
                 d = d[np.isfinite(d)]
                 lo, hi = np.percentile(d, 2.5), np.percentile(d, 97.5)
-                p_ba = _ks_above(a[:, 1], ref[:, 1])
-                print(f"{label:>14}  {row}  {p_ba:>9.4f}  "
+                p_pair = _perm_gt(a[:, 1], ref[:, 1])
+                print(f"{label:>14}  {row}  {p_pair:>9.4f}  "
                       f"[{lo:.4f}, {hi:.4f}]")
 
     print()
     print("step 2b: CB-NV source-deconfounded GBC trained on NeuroVoz, evaluated on PC directly")
+    Xs_s = Xs[:, sel]
     for model in GRAPH_MODELS:
         W = _cb(Xs, ys, ags, sxs, model=model, up=ups, gr=grs)
         w_cb = W[np.arange(len(ys)), ys.astype(int)]
-        g_cb = _gbc(Xs, ys, w_cb)
-        g_raw = _gbc(Xs, ys)
+        g_cb = _gbc(Xs_s, ys, w_cb)
+        g_raw = _gbc(Xs_s, ys)
         for name, (X_pc, y_pc, _, _) in pc.items():
             m0 = ~np.isnan(X_pc).any(axis=1)
-            Xt = (X_pc[m0] - mu_s) / sd_s
+            Xt = (X_pc[m0][:, sel] - mu_s[sel]) / sd_s[sel]
             yt = y_pc[m0]
             mc = _metrics(yt, g_cb.predict_proba(Xt)[:, 1])
             mr = _metrics(yt, g_raw.predict_proba(Xt)[:, 1])
