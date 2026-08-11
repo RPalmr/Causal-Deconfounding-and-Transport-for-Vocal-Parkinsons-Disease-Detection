@@ -422,7 +422,7 @@ def main():
             U_pc_tr = pca.transform(X_tr_full[:, INTENSITY_IDX])[:, k_u]
             w_loc = _loc_weights(X_tr, y_tr, age_pc[tr])
             w_loc = w_loc[np.arange(len(y_tr)), y_tr.astype(int)]
-            w_tcb = _tcb_weights(U_ref, U_pc_tr, y_tr)
+            w_tcb = _tcb_weights(U_nv, U_pc_tr, y_tr)
             g_std = _gbc(X_tr, y_tr)
             g_loc = _gbc(X_tr, y_tr, w_loc)
             g_tcb = _gbc(X_tr, y_tr, w_tcb)
