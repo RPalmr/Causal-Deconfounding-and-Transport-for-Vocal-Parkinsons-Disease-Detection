@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, re
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -102,11 +102,24 @@ def _sl(df, kv, common, meta_cols):
               .loc[:, ~df.columns.isin(meta_cols)]
               .set_index(kv[kv.isin(common)].values))
 
-def load_nv():
+def _task(c):
+    s = str(c)
+    s = s.rsplit("/", 1)[-1]
+    while s.endswith(".wav"):
+        s = s[:-4]
+    s = s.replace("audios-", "").replace("audios/", "")
+    if s.startswith("PD_"):
+        s = s[3:]
+    elif s.startswith("HC_"):
+        s = s[3:]
+    s = re.sub(r"_\d+$", "", s)
+    return s
+
+def load_nv(task=None):
     hc = pd.read_csv(str(BASE) + '/data/neurovoz/metadata/metadata_hc.csv')
     pd_ = pd.read_csv(str(BASE) + '/data/neurovoz/metadata/metadata_pd.csv')
     mt = pd.concat([hc, pd_], ignore_index=True)
-    mt["_pid"] = mt["ID"].map(lambda i: f"{int(i):04d}")
+    mt["_pid"] = mt["ID"].map(lambda i: str(int(i)).zfill(4))
     mt["Age"] = pd.to_numeric(mt["Age"], errors="coerce")
     a_by_pid = mt.groupby("_pid")["Age"].median()
     mt["Sex"] = pd.to_numeric(mt["Sex"], errors="coerce")
@@ -132,6 +145,9 @@ def load_nv():
                   pause["tot_name"].apply(_stem),
                   syll["tot_name"].apply(_stem))
     common = sorted(set(ki) & set(kp) & set(ks))
+    if task is not None:
+        common = [c for c in common if _task(c) == task]
+
     X = pd.concat([_sl(intens, ki, common, META_COLS),
                    _sl(pause, kp, common, META_COLS),
                    _sl(syll, ks, common, META_COLS)], axis=1)
@@ -144,7 +160,11 @@ def load_nv():
                    u_by_pid.get(p, np.nan) for p in pid], dtype=np.float64)
     gr = np.array([grbas.get(c[3:], np.nan) for c in common], dtype=np.float64)
     ok = ~(np.isnan(X).any(axis=1) | np.isnan(ag) | np.isnan(sx))
-    return X[ok], Y[ok], ag[ok], sx[ok], pid[ok], up[ok], gr[ok]
+    X, Y, ag, sx, pid, up, gr = X[ok], Y[ok], ag[ok], sx[ok], pid[ok], up[ok], gr[ok]
+    if task is not None:
+        return X, Y, ag, sx, pid, up, gr
+    tasks = np.array([_task(c) for c in common])[ok]
+    return X, Y, ag, sx, pid, up, gr, tasks
 
 def load_pc():
     base = str(BASE) + '/data/parkceleb_extracted'
@@ -182,12 +202,6 @@ def load_pc():
     wb = openpyxl.load_workbook(str(BASE) + '/data/ParkCeleb/PD_demo.xlsx',
                                 read_only=True)
     rows = list(wb.active.iter_rows(values_only=True))
-    hdr = [str(c).strip().lower().replace(" ", "") for c in rows[0]]
-    yod = {}
-    for r in rows[2:]:
-        if r[0] is None:
-            continue
-        yod[str(r[0]).strip()] = int(str(r[hdr.index("yod")]).strip())
     wb2 = openpyxl.load_workbook(str(BASE) + '/data/ParkCeleb/speakers_pairs.xlsx',
                                  read_only=True)
     rows2 = list(wb2.active.iter_rows(values_only=True))
@@ -203,10 +217,8 @@ def load_pc():
         if vid not in up.index:
             continue
         uy = up[vid]
-        yr = yod.get(sp) if sp.startswith("pd_") else yod.get(pairs.get(sp))
-        if yr is None:
-            continue
-        iv[i] = uy - yr
+        yr = None
+        iv[i] = uy - yr if yr is not None else np.nan
 
     out = {"full": (X, Y, sid, t_age)}
     for name, (lo, hi) in INTERVALS.items():
@@ -221,6 +233,23 @@ def _gbc(X, y, w=None):
         w = np.asarray(w, dtype=float)
         w = w * (len(X) / w.sum())
     clf.fit(np.asarray(X), y.astype(int), sample_weight=w)
+    return clf
+
+def _gbc_two_stage(X_base, y_base, w_base, X_spec, y_spec, w_spec, extra_trees=20):
+    clf = GradientBoostingClassifier(n_estimators=100, learning_rate=0.1,
+                                     max_depth=3, random_state=RANDOM_SEED,
+                                     warm_start=True)
+    if w_base is not None:
+        w_base = np.asarray(w_base, dtype=float)
+        w_base = w_base * (len(X_base) / w_base.sum())
+    clf.fit(np.asarray(X_base), y_base.astype(int), sample_weight=w_base)
+    
+    clf.n_estimators += extra_trees
+    if w_spec is not None:
+        w_spec = np.asarray(w_spec, dtype=float)
+        w_spec = w_spec * (len(X_spec) / w_spec.sum())
+    clf.fit(np.asarray(X_spec), y_spec.astype(int), sample_weight=w_spec)
+    
     return clf
 
 def _cb(X, y, ag, sx, model="age", up=None, gr=None):
@@ -341,11 +370,55 @@ def _perm_gt(a, b, n_flip=10000, seed=7):
     null = (d[None, :] * (2 * flips - 1)).mean(axis=1)
     return float((null >= obs).mean())
 
+def _backdoor_effect(U_tr, v_tr, y_tr, U_tgt, reps=N_REPS):
+    rng = np.random.default_rng(RANDOM_SEED)
+    rows = [[], [], []]
+    for rep in range(reps):
+        n = len(v_tr)
+        idx = rng.integers(0, n, n)
+        u, v, y = U_tr[idx], v_tr[idx], y_tr[idx]
+        k_all = gaussian_kde(u.T)(u.T)
+        k_y = np.empty(n)
+        for c in (0, 1):
+            m = y == c
+            if m.sum() < 3:
+                return rows
+            k_y[m] = gaussian_kde(u[m].T)(u[m].T)
+        w_s = k_all / np.maximum(k_y, 1e-12)
+        k_t = gaussian_kde(U_tgt[rng.integers(0, len(U_tgt), n)].T)(u.T)
+        w_t = k_t / np.maximum(k_y, 1e-12)
+        rows[0].append(v[y == 1].mean() - v[y == 0].mean())
+        rows[1].append(w_s[y == 1].dot(v[y == 1]) / w_s[y == 1].sum()
+                       - w_s[y == 0].dot(v[y == 0]) / w_s[y == 0].sum())
+        rows[2].append(w_t[y == 1].dot(v[y == 1]) / w_t[y == 1].sum()
+                       - w_t[y == 0].dot(v[y == 0]) / w_t[y == 0].sum())
+    return rows
+
+def _eval_backdoor(U_nv, v_nv, ys, X_pc, mu_s, sd_s, pca, k_u):
+    m = ~np.isnan(X_pc).any(axis=1)
+    U_pc = pca.transform((X_pc[m][:, INTENSITY_IDX] - mu_s[INTENSITY_IDX])
+                         / sd_s[INTENSITY_IDX])[:, k_u]
+    rows = _backdoor_effect(U_nv, v_nv, ys, U_pc)
+    print()
+    print("step 3: causal effect of pd on voice, backdoor over u")
+    print("   u -> y, u -> x, y -> x   (u measured on both corpora)")
+    hdr = "estimator          effect              95% ci    population"
+    print(hdr)
+    for lab, k in (("naive", 0), ("backdoor, source p(u)", 1),
+                   ("backdoor, target p(u)", 2)):
+        a = np.asarray(rows[k], dtype=float)
+        a = a[np.isfinite(a)]
+        lo, hi = np.percentile(a, 2.5), np.percentile(a, 97.5)
+        pop = "pd under nv severity" if k < 2 else "pd under pc severity"
+        print(lab + "  " + str(round(a.mean(), 4)) + "  [" + str(round(lo, 4)) + ", " + str(round(hi, 4)) + "]  " + pop)
+    return rows
+
 def _eval_pc(X_pc, y_pc, sid_pc, age_pc, U_nv, pca, k_u, label):
     m0 = ~np.isnan(X_pc).any(axis=1)
     X_pc, y_pc, sid_pc, age_pc = X_pc[m0], y_pc[m0], sid_pc[m0], age_pc[m0]
     if len(np.unique(sid_pc)) < 4:
-        print(f"\n--- {label}: only {len(np.unique(sid_pc))} speakers, skipped ---")
+        print()
+        print(+ label + ": only " + str(len(np.unique(sid_pc))) + " speakers, skipped")
         return
     arms = ["standard", "localized", "tcb"]
     res = {k: [] for k in arms}
@@ -368,44 +441,43 @@ def _eval_pc(X_pc, y_pc, sid_pc, age_pc, U_nv, pca, k_u, label):
         res["localized"].append(_metrics(y_te, g_loc.predict_proba(X_te)[:, 1]))
         res["tcb"].append(_metrics(y_te, g_tcb.predict_proba(X_te)[:, 1]))
 
-    print(f"\n--- {label}: n={len(y_pc)}, speakers={len(np.unique(sid_pc))}, "
-          f"reps={N_REPS} ---")
-    hdr = (f"{'method':>14}  " +
-           "  ".join(f"{m:>19}" for m in ("acc", "ba", "f1", "auc")) +
-           "  " + f"{'p_pair':>9}" + "  " + f"{'diff_ci':>20}")
+    print()
+    print(" + label + ": n=" + str(len(y_pc)) + ", speakers=" + str(len(np.unique(sid_pc))) + ", reps=" + str(N_REPS) + ")
+    hdr = "method                     acc                  ba                   f1                 auc     p_pair               diff_ci"
     print(hdr)
-    for key, label in (("standard", "Standard"),
-                       ("localized", "Localised (PC)"),
-                       ("tcb", "TCB (NV->PC)")):
+    for key, lab in (("standard", "standard"),
+                     ("localized", "localised (pc)"),
+                     ("tcb", "tcb (nv->pc)")):
         a = np.asarray(res[key])
-        row = "  ".join(f"{_nan_mean(a[:, k]):>9.4f}±{_nan_std(a[:, k]):.4f}"
-                        for k in range(4))
+        row = ""
+        for k in range(4):
+            row += str(round(_nan_mean(a[:, k]), 4)) + "+/-" + str(round(_nan_std(a[:, k]), 4)) + "  "
         if key == "standard":
-            print(f"{label:>14}  {row}")
+            print(lab + "  " + row)
         else:
             ref = np.asarray(res["standard"])
             d = a[:, 1] - ref[:, 1]
             d = d[np.isfinite(d)]
             lo, hi = np.percentile(d, 2.5), np.percentile(d, 97.5)
             p_pair = _perm_gt(a[:, 1], ref[:, 1])
-            print(f"{label:>14}  {row}  {p_pair:>9.4f}  "
-                  f"[{lo:.4f}, {hi:.4f}]")
+            print(lab + "  " + row + "  " + str(round(p_pair, 4)) + "  [" + str(round(lo, 4)) + ", " + str(round(hi, 4)) + "]")
 
 def main():
-    X_raw, ys, ags, sxs, _, ups, grs = load_nv()
+    X_raw, ys, ags, sxs, _, ups, grs, tasks = load_nv()
+    X_raw_pb, ys_pb, ags_pb, sxs_pb, _, ups_pb, grs_pb = load_nv(task="PETACA_BLANCA")
     if ags.size > 0:
-        age_str = 'age [' + str(int(np.nanmin(ags))) + '-' + str(int(np.nanmax(ags))) + ']'
+        age_str = "age [" + str(int(np.nanmin(ags))) + "-" + str(int(np.nanmax(ags))) + "]"
     else:
-        age_str = 'age [no data]'
-    print('nv: ' + str(X_raw.shape[0]) + ' recordings (' + str(int(ys.sum())) +
-          ' pd / ' + str(len(ys) - int(ys.sum())) + ' hc), ' + age_str, flush=True)
+        age_str = "age [no data]"
+    print("nv: " + str(X_raw.shape[0]) + " recordings (" + str(int(ys.sum())) + " pd / " + str(len(ys) - int(ys.sum())) + " hc), " + age_str)
 
     mu_s, sd_s = X_raw.mean(0), X_raw.std(0)
     sd_s = np.maximum(sd_s, np.median(sd_s) * 0.05)
     Xs = (X_raw - mu_s) / sd_s
+    Xs_pb = (X_raw_pb - mu_s) / sd_s
 
     print()
-    print("step 1: semi-synthetic confounder verification (simulated U)")
+    print("step 1: semi-synthetic confounder verification (simulated u)")
     sc = _SS().fit(X_raw)
     Xc = sc.transform(X_raw)
     tr_conf = _synth_conf(Xc, ys, SYNTH_QY_CONF, SYNTH_QYZ, SYNTH_BRIGHT, 1, 101)
@@ -424,47 +496,53 @@ def main():
         "unconf-trained": _gbc(tr_unconf[0], tr_unconf[1]),
         "confounded (reverse)": _gbc(tr_rev[0], tr_rev[1]),
         "deconfounded (reverse)": _gbc(tr_rev[0], tr_rev[1], w_dec_r),
-        "deconfounded (U-proj)": _gbc(tr_proj[0], tr_proj[1], w_proj),
+        "deconfounded (u-proj)": _gbc(tr_proj[0], tr_proj[1], w_proj),
     }
-    print(f"{'model':>22}  {'conf-test acc':>14} {'conf-test ba':>14}  "
-          f"{'unconf-test acc':>15} {'unconf-test ba':>15}")
+    print("                 model     conf-test acc     conf-test ba    unconf-test acc   unconf-test ba")
     for name, g in mods.items():
         m1 = _metrics(te_conf[1], g.predict_proba(te_conf[0])[:, 1])
         m2 = _metrics(te_unconf[1], g.predict_proba(te_unconf[0])[:, 1])
-        print(f"{name:>22}  {m1[0]:>12.4f} {m1[1]:>12.4f}  "
-              f"{m2[0]:>13.4f} {m2[1]:>13.4f}", flush=True)
+        print(name.rjust(22) + "  " + str(round(m1[0], 4)) + "  " + str(round(m1[1], 4)) + "  " + str(round(m2[0], 4)) + "  " + str(round(m2[1], 4)))
 
     pc = load_pc()
     print()
-    print("step 2: causal transportability NV -> PC (speaker-level split)")
+    print("step 2: causal transportability nv -> pc (speaker-level split)")
 
     pca = PCA(n_components=5)
     L_nv = pca.fit_transform(Xs[:, INTENSITY_IDX])
     corrs_u = np.array([abs(np.corrcoef(L_nv[:, i], ys)[0, 1]) for i in range(5)])
     k_u = np.argsort(corrs_u)[:U_DIMS]
     U_nv = L_nv[:, k_u]
-    print("   U = PCs " + str(k_u + 1) + " of nv intensity block (|r(Y)| <= %.3f)"
-          % corrs_u[k_u].max())
+    print("   u = pcs " + str(k_u + 1) + " of nv intensity block (|r(y)| <= " + str(round(corrs_u[k_u].max(), 3)) + ")")
 
     for name, (X_pc, y_pc, sid_pc, age_pc) in pc.items():
         _eval_pc(X_pc, y_pc, sid_pc, age_pc, U_nv, pca, k_u, name)
 
+    v_pc = PCA(n_components=1).fit(Xs).transform(Xs)[:, 0]
+    _eval_backdoor(U_nv, v_pc, ys, pc["full"][0], mu_s, sd_s, pca, k_u)
+
     print()
-    print("step 2b: CB-NV source-deconfounded GBC trained on NeuroVoz, evaluated on PC directly")
+    print("step 2b: two-stage transfer learning (all tasks -> petaca blanca)")
+    print("base source: all tasks (n=" + str(len(ys)) + ")")
+    print("fine-tune source: petaca blanca (n=" + str(len(ys_pb)) + ")")
+
     for model in GRAPH_MODELS:
-        W = _cb(Xs, ys, ags, sxs, model=model, up=ups, gr=grs)
-        w_cb = W[np.arange(len(ys)), ys.astype(int)]
-        g_cb = _gbc(Xs, ys, w_cb)
-        g_raw = _gbc(Xs, ys)
+        W_base = _cb(Xs, ys, ags, sxs, model=model, up=ups, gr=grs)
+        w_base = W_base[np.arange(len(ys)), ys.astype(int)]
+        
+        W_spec = _cb(Xs_pb, ys_pb, ags_pb, sxs_pb, model=model, up=ups_pb, gr=grs_pb)
+        w_spec = W_spec[np.arange(len(ys_pb)), ys_pb.astype(int)]
+        
+        g_cb = _gbc_two_stage(Xs, ys, w_base, Xs_pb, ys_pb, w_spec, extra_trees=20)
+        g_raw = _gbc_two_stage(Xs, ys, None, Xs_pb, ys_pb, None, extra_trees=20)
+        
         for name, (X_pc, y_pc, _, _) in pc.items():
             m0 = ~np.isnan(X_pc).any(axis=1)
             Xt = (X_pc[m0] - mu_s) / sd_s
             yt = y_pc[m0]
             mc = _metrics(yt, g_cb.predict_proba(Xt)[:, 1])
             mr = _metrics(yt, g_raw.predict_proba(Xt)[:, 1])
-            print(f"{model:>9} {name:>6}  " +
-                  " ".join(f"{mc[k]:.4f}/{mr[k]:.4f}" for k in (0, 1, 2, 3)),
-                  flush=True)
+            print(model.rjust(9) + " " + name.rjust(6) + "  " + str(round(mc[0], 4)) + "/" + str(round(mr[0], 4)) + " " + str(round(mc[1], 4)) + "/" + str(round(mr[1], 4)) + " " + str(round(mc[2], 4)) + "/" + str(round(mr[2], 4)) + " " + str(round(mc[3], 4)) + "/" + str(round(mr[3], 4)))
 
 if __name__ == "__main__":
     main()
