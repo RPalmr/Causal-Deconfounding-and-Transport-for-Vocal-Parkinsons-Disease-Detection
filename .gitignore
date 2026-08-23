@@ -12,3 +12,4 @@ tests/_archive/
 presentation/
 old/causal.py
 outputs/
+deps/
