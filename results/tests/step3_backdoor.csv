@@ -1,0 +1,3 @@
+estimator,effect,ci_lo,ci_hi,population
+naive,-1.0541243037932748,-1.3147593242871536,-0.8008399700480241,pd under nv severity
+weighted by target p(u),-0.9980907572142182,-1.5016544250923838,-0.47518088561985594,pd under pc severity
