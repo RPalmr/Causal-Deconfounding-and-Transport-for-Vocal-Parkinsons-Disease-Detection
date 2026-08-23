@@ -10,7 +10,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.svm import SVC
-from tqdm import tqdm
 
 import old.causal as c
 
@@ -148,10 +147,10 @@ def nv_weights(graph, X, y, ag, sx, up, gr):
     return weights(graph, X, y, feats)
 
 
-def deconf_game(W, X, y, pid, reps, repeats, variant="weights", label=None):
+def deconf_game(W, X, y, pid, reps, repeats, variant="weights"):
     X, y, pid = np.asarray(X), np.asarray(y), np.asarray(pid)
     conf, dec = [], []
-    for rep in tqdm(range(reps), desc=label, leave=False):
+    for rep in range(reps):
         for tr, te in fold_masks(pid, y, RANDOM_SEED + rep):
             seed = RANDOM_SEED + rep
             if variant == "weights":
@@ -191,7 +190,7 @@ def semisynth(X, y, sex, pid, repeats):
 
     def loo(k, Xtr, ytr, pidtr, Xte, yte):
         ba = []
-        for u in tqdm(np.unique(pidtr), leave=False):
+        for u in np.unique(pidtr):
             m = pidtr != u
             if len(np.unique(ytr[m])) < 2:
                 continue
@@ -222,7 +221,6 @@ def transfer(pc, xfer_reps, cb_repeats):
             continue
         if done(path, ["interval", "reps", "cb_repeats"],
                 [name, xfer_reps, cb_repeats]):
-            print("  interval %-3s already saved, skipping" % name)
             continue
         m0 = ~np.isnan(X_pc).any(axis=1)
         X_t = (X_pc[m0] - mu) / sd
@@ -230,7 +228,7 @@ def transfer(pc, xfer_reps, cb_repeats):
         Upc = pca.transform(X_t[:, c.INTENSITY_IDX])[:, ku]
         Wt = np.column_stack([c._tcb_weights(Upc, Unv, yp, clip=TCB_CLIP)] * 2)
         med = {"conf": [], "dec": []}
-        for rep in tqdm(range(xfer_reps), desc="interval %s" % name, leave=False):
+        for rep in range(xfer_reps):
             Xd, yd, _ = resample(Xs, yp, Wt, pid_pb, cb_repeats,
                                  seed=RANDOM_SEED + rep)
             gd = c._gbc(Xd, yd, seed=RANDOM_SEED + rep)
@@ -239,8 +237,6 @@ def transfer(pc, xfer_reps, cb_repeats):
             med["conf"].append(speaker_ba(sid_t, y_t, gc.predict_proba(X_t)[:, 1]))
         mc, md = float(np.median(med["conf"])), float(np.median(med["dec"]))
         p = ks_p(med["dec"], med["conf"])
-        print("  %-3s  conf=%.4f  deconf=%.4f  dacc=%+.4f  p_ks=%.4f" % (
-            name, mc, md, md - mc, p))
         rows.append([name, mc, md, md - mc, p, xfer_reps, cb_repeats])
     if rows:
         save(path, ["interval"], XFER_COLS, rows)
@@ -253,7 +249,6 @@ def rep_pc():
         if name == "full" or len(np.unique(sid_pc)) < 8:
             continue
         if done(path, ["interval"], [name]):
-            print("  interval %-3s already saved, skipping" % name)
             continue
         ba = []
         for seed in range(RANDOM_SEED, RANDOM_SEED + 5):
@@ -262,8 +257,6 @@ def rep_pc():
                 g = c._gbc(sc.transform(X_pc[tr]), y_pc[tr])
                 ba.append(balacc(y_pc[te], g.predict_proba(sc.transform(X_pc[te]))[:, 1]))
         ba = float(np.mean(ba))
-        print("  interval %-3s n=%-4d speakers=%-3d ba=%.4f" % (
-            name, len(y_pc), len(np.unique(sid_pc)), ba))
         rows.append([name, len(y_pc), len(np.unique(sid_pc)), ba])
     if rows:
         save(path, ["interval"], ["interval", "n", "speakers", "ba"], rows)
@@ -280,8 +273,6 @@ def rep_nv():
     X = ag[feats].values.astype(np.float64)
     y = ag["pk_label"].values.astype(int)
     pid = ag.index.values
-    print("  patients=%d  pd=%d  hc=%d  features=%d" % (
-        len(pid), int(y.sum()), len(y) - int(y.sum()), len(feats)))
     path = OUT + "/pipeline_replication_nv.csv"
     models = [("random forest", RandomForestClassifier(
         n_estimators=100, random_state=RANDOM_SEED)),
@@ -291,7 +282,6 @@ def rep_nv():
     rows = []
     for name, model in models:
         if done(path, ["model"], [name]):
-            print("  %-20s  already saved, skipping" % name)
             continue
         ba = []
         for seed in range(RANDOM_SEED, RANDOM_SEED + 5):
@@ -300,7 +290,6 @@ def rep_nv():
                 model.fit(sc.transform(X[tr]), y[tr])
                 ba.append(balacc(y[te], model.predict_proba(sc.transform(X[te]))[:, 1]))
         ba = float(np.mean(ba))
-        print("  %-20s  ba=%.4f" % (name, ba))
         rows.append([name, ba])
     if rows:
         save(path, ["model"], ["model", "ba"], rows)
@@ -331,21 +320,17 @@ def accent_map():
 
 
 def quality_arms(path4, rows, Xf, yf, sidf, mq, qv, qcols, pc_reps, cb_repeats):
-    def run(var, label, vals, bins):
+    def run(var, vals, bins):
         if done(path4, ["variable", "reps", "cb_repeats"],
                 [var, pc_reps, cb_repeats]):
-            print("  %-36s already saved, skipping" % label)
             return
         W = weights(GRAPH_QUALITY, Xf[mq], yf[mq], [("Quality", vals, bins, False)])
-        conf, dec = deconf_game(W, Xf[mq], yf[mq], sidf[mq], pc_reps, cb_repeats,
-                                label=label)
+        conf, dec = deconf_game(W, Xf[mq], yf[mq], sidf[mq], pc_reps, cb_repeats)
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
-        print("  %-36s n=%-5d conf=%.4f  deconf=%.4f  dacc=%+.4f  p_ks=%.4f" % (
-            label, len(vals), mc, md, md - mc, p))
         rows.append([var, len(vals), mc, md, md - mc, p, pc_reps, cb_repeats])
 
-    run("quality", "pc quality", qv[mq], [5] * len(qcols))
+    run("quality", qv[mq], [5] * len(qcols))
     sco = []
     for j in range(len(qcols)):
         ba = []
@@ -354,8 +339,7 @@ def quality_arms(path4, rows, Xf, yf, sidf, mq, qv, qcols, pc_reps, cb_repeats):
             ba.append(balacc(yf[mq].astype(int)[te], svc.predict(qv[mq][te, j:j + 1])))
         sco.append(float(np.mean(ba)))
     jb = int(np.argmax(sco))
-    run("quality-" + qcols[jb], "pc quality-" + qcols[jb],
-        qv[mq][:, jb:jb + 1], [10])
+    run("quality-" + qcols[jb], qv[mq][:, jb:jb + 1], [10])
 
 
 def main():
@@ -384,11 +368,6 @@ def main():
     q = pd.read_csv(QUALITY_CSV) if os.path.exists(QUALITY_CSV) else None
 
     X, y, ag, sx, pid, up, gr = nv_data()
-    print("  neurovoz: Age pd=%.1f hc=%.1f | Sex pd=%.1f hc=%.1f | UPDRS pd=%.1f | GRBAS pd=%.2f hc=%.2f" % (
-        ag[y.astype(int) == 1].mean(), ag[y.astype(int) == 0].mean(),
-        sx[y.astype(int) == 1].mean(), sx[y.astype(int) == 0].mean(),
-        np.nanmedian(up[y.astype(int) == 1]),
-        np.nanmean(gr[y.astype(int) == 1]), np.nanmean(gr[y.astype(int) == 0])))
 
     path3 = OUT + "/pipeline_variants_nv.csv"
     rows3 = []
@@ -396,16 +375,12 @@ def main():
                            ("ug-as[a]", "bootstrap"), ("ug-as[a]", "weights")):
         if done(path3, ["graph", "variant", "reps", "cb_repeats"],
                 [graph, variant, args.nv_reps, args.cb_repeats]):
-            print("  nv %-8s %-9s already saved, skipping" % (graph, variant))
             continue
         gx = GRAPH_CONTROL if graph == "control" else c.GRAPH_MODELS[graph]
         W = nv_weights(gx, X, y, ag, sx, up, gr)
-        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, variant,
-                                label="nv %s %s" % (graph, variant))
+        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, variant)
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
-        print("  nv %-8s %-9s conf=%.4f  deconf=%.4f  dacc=%+.4f  p_ks=%.4f" % (
-            graph, variant, mc, md, md - mc, p))
         rows3.append([graph, variant, mc, md, md - mc, p,
                       args.nv_reps, args.cb_repeats])
     if rows3:
@@ -414,27 +389,23 @@ def main():
     path4 = OUT + "/pipeline_samecorpus_pc.csv"
     rows4 = []
 
-    def pc_arm(var, graph, feat, X, y, sid, vals, bins, disc, label, n):
+    def pc_arm(var, graph, feat, X, y, sid, vals, bins, disc):
         if done(path4, ["variable", "reps", "cb_repeats"],
                 [var, args.pc_reps, args.cb_repeats]):
-            print("  %-14s already saved, skipping" % label)
             return
         W = weights(graph, X, y, [(feat, vals, bins, disc)])
-        conf, dec = deconf_game(W, X, y, sid, args.pc_reps, args.cb_repeats, label=label)
+        conf, dec = deconf_game(W, X, y, sid, args.pc_reps, args.cb_repeats)
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
-        print("  %-14s n=%-5d conf=%.4f  deconf=%.4f  dacc=%+.4f  p_ks=%.4f" % (
-            label, n, mc, md, md - mc, p))
-        rows4.append([var, n, mc, md, md - mc, p, args.pc_reps, args.cb_repeats])
+        rows4.append([var, len(vals), mc, md, md - mc, p, args.pc_reps, args.cb_repeats])
 
     m_age = ~np.isnan(agef)
     if len(np.unique(sidf[m_age])) >= 8:
         pc_arm("age", GRAPH_AGE, "Age", Xf[m_age], yf[m_age], sidf[m_age],
-               agef[m_age], 6, False, "pc age", int(m_age.sum()))
+               agef[m_age], 6, False)
     if ok_a.any() and len(np.unique(sidf[ok_a])) >= 8:
         pc_arm("accent", GRAPH_ACCENT, "Accent", Xf[ok_a], yf[ok_a], sidf[ok_a],
-               accent_all[ok_a], len(np.unique(accent_all[ok_a])), True,
-               "pc accent", int(ok_a.sum()))
+               accent_all[ok_a], len(np.unique(accent_all[ok_a])), True)
     if q is not None:
         qcols = [x for x in q.columns
                  if x not in ("video_id", "audio_file", "speaker_id")]
@@ -489,15 +460,12 @@ def main():
     path4b = OUT + "/pipeline_samecorpus_nv.csv"
     if done(path4b, ["graph", "reps", "cb_repeats"],
             ["g-as[a]", args.nv_reps, args.cb_repeats]):
-        print("  nv g-as[a]  already saved, skipping")
+        pass
     else:
         W = nv_weights(c.GRAPH_MODELS["g-as[a]"], X, y, ag, sx, up, gr)
-        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, "bootstrap",
-                                label="nv g-as[a]")
+        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, "bootstrap")
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
-        print("  nv g-as[a]  conf=%.4f  deconf=%.4f  dacc=%+.4f  p_ks=%.4f" % (
-            mc, md, md - mc, p))
         save(path4b, ["graph"], NV1_COLS,
              [["g-as[a]", mc, md, md - mc, p, args.nv_reps, args.cb_repeats]])
 
@@ -505,7 +473,7 @@ def main():
     cases = ("conf->conf", "conf->rev", "dec->conf", "dec->rev")
     if all(done(path4c, ["case", "cb_repeats"], [case, args.cb_repeats])
            for case in cases):
-        print("  semisynth  all cases already saved, skipping")
+        pass
     else:
         res = semisynth(X, y, sx, pid, args.cb_repeats)
         save(path4c, ["case"], ["case", "ba", "cb_repeats"],
