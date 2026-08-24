@@ -181,29 +181,6 @@ def conf_subsample(X, y, sex, p_m, p_f, seed):
     return np.asarray(X)[i], y[i], sex[i], i
 
 
-def semisynth(X, y, sex, pid, repeats):
-    Xc, yc, sc, ic = conf_subsample(X, y, sex, 0.8, 0.2, 101)
-    Xr, yr, _, ir = conf_subsample(X, y, sex, 0.2, 0.8, 202)
-    pidc, pidr = np.asarray(pid)[ic], np.asarray(pid)[ir]
-    Wc = weights(GRAPH_SEX, Xc, yc, [("Sex", sc, 2, True)])
-    Xd, yd, pidd = resample(Xc, yc, Wc, pidc, repeats)
-
-    def loo(k, Xtr, ytr, pidtr, Xte, yte):
-        ba = []
-        for u in np.unique(pidtr):
-            m = pidtr != u
-            if len(np.unique(ytr[m])) < 2:
-                continue
-            g = c._gbc(Xtr[m], ytr[m], seed=RANDOM_SEED + k)
-            ba.append(balacc(yte, g.predict_proba(Xte)[:, 1]))
-        return np.mean(ba)
-
-    return {"conf->conf": loo(1, Xc, yc, pidc, Xc, yc),
-            "conf->rev": loo(2, Xc, yc, pidc, Xr, yr),
-            "dec->conf": loo(3, Xd, yd, pidd, Xc, yc),
-            "dec->rev": loo(4, Xd, yd, pidd, Xr, yr)}
-
-
 def transfer(pc, xfer_reps, cb_repeats):
     Xp, yp, agp, sxp, _, up_p, gr_p = c.load_nv(task="PETACA_BLANCA")
     pid_pb = np.arange(len(yp))
@@ -468,16 +445,6 @@ def main():
         p = ks_p(dec, conf)
         save(path4b, ["graph"], NV1_COLS,
              [["g-as[a]", mc, md, md - mc, p, args.nv_reps, args.cb_repeats]])
-
-    path4c = OUT + "/pipeline_semisynth.csv"
-    cases = ("conf->conf", "conf->rev", "dec->conf", "dec->rev")
-    if all(done(path4c, ["case", "cb_repeats"], [case, args.cb_repeats])
-           for case in cases):
-        pass
-    else:
-        res = semisynth(X, y, sx, pid, args.cb_repeats)
-        save(path4c, ["case"], ["case", "ba", "cb_repeats"],
-             [[case, res[case], args.cb_repeats] for case in cases])
 
     transfer(pc, args.xfer_reps, args.cb_repeats)
 
