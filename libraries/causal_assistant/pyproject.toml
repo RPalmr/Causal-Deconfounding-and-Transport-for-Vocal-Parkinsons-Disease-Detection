@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+
+[project]
+name = "causal-assistant"
+authors = [
+  { name="Nathan Cartlidge", email="nac120@student.bham.ac.uk" },
+  { name="Jianqiao Mao", email="jxm1417@student.bham.ac.uk" },
+]
+version = "0.3.0"
+readme = "README.md"
+description = "Causal Bootstrapping utility package"
+requires-python = ">=3.12"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research"
+]
+license = "GPL-3.0"
+license-files = ["LICENSE"]
+dependencies = [
+  # runtime requirements goes here
+  "causalBootstrapping>=0.1.5",
+  "matplotlib>=3.10.1",
+  "numpy>=1.26.4",
+  "pandas>=2.2.3",
+  "scikit-learn>=1.5.2",
+  "sympy>=1.13.3",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/nathancartlidge/causal_assistant"
+"Bug Tracker" = "https://github.com/nathancartlidge/causal_assistant/issues"
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["causal_assistant*"]
+exclude = ["demos*"]
+
+[tool.setuptools.dynamic]
+readme = {file = "README.md"}

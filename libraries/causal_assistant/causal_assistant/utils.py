@@ -1,0 +1,248 @@
+"""A set of methods to somewhat simplify the process of causal bootstrapping"""
+import re
+import inspect
+import warnings
+
+from typing import Any, Literal, TypeAlias
+
+import numpy as np
+import pandas as pd
+
+from causalbootstrapping import workflows as cb
+from causalbootstrapping.distEst_lib import MultivarContiDistributionEstimator as MCDE
+
+
+FeatureType: TypeAlias = np.ndarray | pd.DataFrame | pd.Series
+BinFeatureType: TypeAlias = np.ndarray | pd.DataFrame | pd.Series | \
+                            tuple[np.ndarray | pd.DataFrame | pd.Series, int | list[int]]
+
+
+def _find_primed_features(function_string):
+    """
+    Finds features which exist in a 'primed' state (typically just the cause var?)
+    :param function_string: The probability function string derived from causal analysis
+    :return: A dictionary mapping unprimed to primed features
+    """
+    primed_features = set(re.compile("([A-z]+'+)").findall(function_string))
+    primed_feature_map = {p.replace("'", ""): p for p in primed_features}
+    return primed_feature_map
+
+
+def make_data_map(function_string, kernel_used: bool, features: dict[str, FeatureType]) -> dict[str, FeatureType]:
+    """
+    Creates the 'data' parameter for general causal bootstrapping
+    :param function_string: The probability function string derived from causal analysis
+    :param kernel_used: Set to true if a kernel is included as part of the data map (subtly changes entries)
+    :param features: All features to be included in the data map. Dataframes will have index inserted for preservation
+    :return: The 'data' argument, properly formatted
+    """
+    for feature in features:
+        if isinstance(features[feature], pd.DataFrame):
+            # insert the index as a value, so it doesn't get lost in the deconfound
+            features[feature] = features[feature].reset_index().values
+
+    primed_features = _find_primed_features(function_string)
+
+    for feature, primed_feature in primed_features.items():
+        features[primed_feature] = features[feature]
+
+    return features
+
+
+def _find_required_distributions(function_string) -> tuple[set[str], dict[str, list[str]]]:
+    dist_matcher = re.compile(r"P\(([\w',_{}]*)\)")
+    distributions = dist_matcher.findall(function_string)
+
+    def _clean(v):
+        v = v.replace("_prime", "'")
+        v = re.sub(r"_{[a-z]}", "", v)
+        return v.replace("'", "_prime")
+
+    required_dists = {}
+    for d in distributions:
+        cleaned = [_clean(v) for v in d.split(",")]
+        key = ",".join(cleaned)
+        required_dists[key] = cleaned
+
+    required_features = set(var for dist in required_dists.values() for var in dist)
+
+    return required_features, required_dists
+
+
+def _make_dist(required_values: list[str], bins: dict[str, list[int]], features: dict[str, FeatureType],
+               fit_method: Literal['kde', 'hist'], estimator_kwargs: dict[str, Any] | None = None):
+    if len(required_values) == 1:
+        data_fit = features[required_values[0].replace("_prime", "")]
+    else:
+        data_fit_values = [features[r.replace("_prime", "")] for r in required_values]
+        data_fit = np.hstack(data_fit_values)
+    estimator = MCDE(data_fit=data_fit)
+    if estimator_kwargs is None:
+        estimator_kwargs = {}
+    if fit_method == "kde":
+        pdf = estimator.fit_kde(**estimator_kwargs)
+    elif fit_method == "hist":
+        nb = []
+        for r in required_values:
+            f = features[r.replace("_prime", "")]
+            nb += bins.get(r.replace("_prime", ""), [0] * f.shape[1])
+        if len(nb) == 1:
+            nb = nb[0]
+        kwargs = dict(estimator_kwargs)
+        kwargs["n_bins"] = nb
+        pdf = estimator.fit_histogram(**kwargs)
+    else:
+        raise ValueError("Unrecognised fit method")
+    pdf_method = lambda **kwargs: pdf(list(kwargs.values())[0]) \
+        if len(kwargs) == 1 else pdf(list(kwargs.values()))
+    params = [inspect.Parameter(name=r, kind=inspect.Parameter.POSITIONAL_OR_KEYWORD) for r in required_values]
+    pdf_method.__signature__ = inspect.Signature(parameters=params)
+    return pdf_method
+
+
+def make_dist_map(function_string, features: dict[str, FeatureType], bins: dict[str, list[int]],
+                  fit_method: Literal['kde', 'hist'] = "kde", estimator_kwargs: dict | None = None):
+    """
+    Creates the 'dist_map' parameter for general causal bootstrapping
+    :param function_string: The probability function string derived from causal analysis
+    :param fit_method: The method to estimate distributions. Can be either 'hist' or 'kde'
+    :param features: All features involved in the de-confounding process. These can either be just the raw feature (for
+                     categorical data) or a tuple of the data and the number of bins requested (for continuous data).
+    :param bins: Bins used for each feature
+    :param estimator_kwargs: arguments to be passed to the estimator
+    :return: A dictionary mapping probability functions to lambda methods representing their distributions
+    """
+    required_features, required_dists = _find_required_distributions(function_string)
+
+    # validation: ensure that all required values have been provided
+    missing_values = [x for x in required_features if x not in features and not x.endswith("_prime")]
+    assert len(missing_values) == 0, f"Not all values provided! {missing_values}"
+
+    # new type of features, now that we have removed all the tuples
+    features: dict[str, np.ndarray]
+
+    if estimator_kwargs is None:
+        estimator_kwargs = {}
+
+    distributions: dict[str, callable] = {}
+    for required_key, required_values in required_dists.items():
+        try:
+            # note that there may be repetitions here!
+            # we are okay with that, it'll just waste a bit of compute
+            pdf_method = _make_dist(required_values, bins, features, fit_method, estimator_kwargs)
+            distributions[required_key] = pdf_method
+        except ValueError:
+            print("Required values were", required_values)
+            raise
+
+    return distributions
+
+
+def _calc_weights(function_string: str, weight_func: callable, cause_var: str,
+                  features: dict[str, FeatureType], bins: dict[str, list[int]], fit_method: Literal['kde', 'hist'],
+                  kernel_used: bool = False):
+    data_map = make_data_map(function_string, kernel_used=kernel_used, features=features)
+    dist_map = make_dist_map(function_string, fit_method=fit_method, features=features, bins=bins)
+    intv_cause = f"intv_{cause_var}"
+    # Mirror what _bootstrap() does: add intv_y-keyed aliases for every
+    # distribution that involves the cause variable.  Without this, complex
+    # graphs (e.g. ug-as[a] with front-door mediators) fail with a KeyError
+    # when the backend substitutes y -> intv_y in its distribution lookups.
+    _add_primed_dists(dist_map, cause_var, intv_cause)
+    # Additionally add y'-aliased entries (apostrophe notation) for any
+    # distribution stored under y_prime.  The backend's w_nom may reference
+    # the primed cause as "y'" (from the GRAPL formula representation) while
+    # make_dist_map stores those distributions under "y_prime".
+    prime_key = cause_var + "_prime"
+    for key in list(dist_map.keys()):
+        parts = key.split(",")
+        if prime_key in parts:
+            alt_parts = [cause_var + "'" if p == prime_key else p for p in parts]
+            alt_key = ",".join(alt_parts)
+            if alt_key not in dist_map:
+                dist_map[alt_key] = dist_map[key]
+    # Use np.where for array-safe comparison, matching _bootstrap()'s kernel.
+    # The scalar "1 if a==b else 0" form raises ValueError when a or b is a
+    # numpy array (which it is during weight_compute for non-kernel graphs).
+    kernel = eval(f"lambda {intv_cause}, {cause_var}: np.where({intv_cause}=={cause_var}, 1.0, 0.0)")
+    N = features[cause_var].shape[0]
+    cause_intv_name_map = {cause_var: intv_cause}
+    w_func_inner = weight_func(dist_map=dist_map, N=N, kernel=kernel,
+                                 cause_intv_name_map=cause_intv_name_map)
+    if isinstance(w_func_inner, tuple):
+        w_func, _ = w_func_inner
+    else:
+        w_func = w_func_inner
+    unique_causes = np.unique(features[cause_var])
+    weights = np.zeros((N, len(unique_causes)), dtype=np.float64)
+    primed_features = _find_primed_features(function_string)
+    if not kernel_used:
+        for feature, _ in primed_features.items():
+            features.pop(feature)
+    for i, y in enumerate(unique_causes):
+        iv = {intv_cause: [y]}
+        weights[:, i] = cb.weight_compute(w_func, data_map, iv)
+    all_weights_equal = np.std(weights, axis=0).sum() < 1e-10
+    if all_weights_equal:
+        warnings.warn("All weights are equal! Check your data")
+    return weights, data_map, unique_causes
+
+
+def _add_primed_dists(dist_map, cause_var, intv_cause):
+    for key in list(dist_map.keys()):
+        parts = key.split(",")
+        if cause_var not in parts:
+            continue
+        new_parts = [intv_cause if p == cause_var else p for p in parts]
+        new_key = ",".join(new_parts)
+        if new_key in dist_map:
+            continue
+        pdf_func = dist_map[key]
+        sig = inspect.signature(pdf_func)
+        params = list(sig.parameters.keys())
+        new_params = [intv_cause.replace("'", "_prime") if p == cause_var else p for p in params]
+        call_pairs = ",".join(f"{u}={p}" for u, p in zip(params, new_params))
+        ns = {"_pdf": pdf_func}
+        exec(f"_f = lambda {','.join(new_params)}: _pdf({call_pairs})", ns)
+        dist_map[new_key] = ns["_f"]
+
+
+def _bootstrap(weight_func: callable, function_string: str, cause_var: str, effect_var: str,
+               fit_method: Literal['kde', 'hist'], steps: int, features: dict[str, FeatureType],
+               bins: dict[str, list[int]], kernel_used: bool | None = None):
+    original_df = features[effect_var]
+    if not isinstance(original_df, pd.DataFrame):
+        original_df = features[effect_var] = pd.DataFrame(features[effect_var])
+    if kernel_used is None:
+        kernel_used = re.match(rf".*(K\({cause_var},{cause_var}'+\)).*", function_string) is not None
+    data_map = make_data_map(function_string, kernel_used=kernel_used, features=features)
+    dist_map = make_dist_map(function_string, fit_method=fit_method, features=features, bins=bins)
+    intv_cause = f"intv_{cause_var}"
+    _add_primed_dists(dist_map, cause_var, intv_cause)
+    kernel = eval(f"lambda {intv_cause}, {cause_var}: np.where({intv_cause}=={cause_var}, 1.0, 0.0)")
+    cause_intv_name_map = {cause_var: intv_cause}
+    from causalbootstrapping.workflows import general_causal_bootstrapping_cf
+    unique_causes = np.unique(features[cause_var])
+    n_per_val = max(steps // len(unique_causes), 1)
+    bootstraps = []
+    for intv_val in unique_causes:
+        iv = intv_cause
+        bd = general_causal_bootstrapping_cf(
+            weight_func_lam=weight_func, dist_map=dist_map, data=data_map,
+            cause_intv_name_map=cause_intv_name_map,
+            intv_dict={iv: [int(intv_val)]},
+            n_sample=n_per_val, kernel=kernel,
+            sampling_mode="fast", random_state=None)
+        bootstraps.append(bd)
+    cb_data = {}
+    for key in bootstraps[0]:
+        cb_data[key] = np.vstack([d[key] for d in bootstraps])
+    levels = original_df.index.nlevels
+    if levels > 1:
+        idx = pd.MultiIndex.from_tuples(cb_data[effect_var][:, 0:levels].tolist(),
+                                        names=original_df.index.names)
+    else:
+        idx = pd.Index(cb_data[effect_var][:, 0], name=original_df.index.name)
+    X = pd.DataFrame(cb_data[effect_var][:, levels:], index=idx, columns=original_df.columns)
+    y = pd.DataFrame(cb_data[cause_var], index=idx)
+    return X, y

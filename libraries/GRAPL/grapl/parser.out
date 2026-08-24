@@ -1,0 +1,179 @@
+Created by PLY version 3.11 (http://www.dabeaz.com/ply)
+
+Grammar
+
+Rule 0     S' -> grapl
+Rule 1     grapl -> TITLE EOC graph
+Rule 2     grapl -> graph
+Rule 3     graph -> graph command
+Rule 4     graph -> command
+Rule 5     command -> NODE EOC
+Rule 6     command -> NODE DIR_EDGE NODE EOC
+Rule 7     command -> NODE BI_EDGE NODE EOC
+
+Terminals, with rules where they appear
+
+BI_EDGE              : 7
+DIR_EDGE             : 6
+EOC                  : 1 5 6 7
+NODE                 : 5 6 6 7 7
+TITLE                : 1
+error                : 
+
+Nonterminals, with rules where they appear
+
+command              : 3 4
+graph                : 1 2 3
+grapl                : 0
+
+Parsing method: LALR
+
+state 0
+
+    (0) S' -> . grapl
+    (1) grapl -> . TITLE EOC graph
+    (2) grapl -> . graph
+    (3) graph -> . graph command
+    (4) graph -> . command
+    (5) command -> . NODE EOC
+    (6) command -> . NODE DIR_EDGE NODE EOC
+    (7) command -> . NODE BI_EDGE NODE EOC
+
+    TITLE           shift and go to state 2
+    NODE            shift and go to state 5
+
+    grapl                          shift and go to state 1
+    graph                          shift and go to state 3
+    command                        shift and go to state 4
+
+state 1
+
+    (0) S' -> grapl .
+
+
+
+state 2
+
+    (1) grapl -> TITLE . EOC graph
+
+    EOC             shift and go to state 6
+
+
+state 3
+
+    (2) grapl -> graph .
+    (3) graph -> graph . command
+    (5) command -> . NODE EOC
+    (6) command -> . NODE DIR_EDGE NODE EOC
+    (7) command -> . NODE BI_EDGE NODE EOC
+
+    $end            reduce using rule 2 (grapl -> graph .)
+    NODE            shift and go to state 5
+
+    command                        shift and go to state 7
+
+state 4
+
+    (4) graph -> command .
+
+    NODE            reduce using rule 4 (graph -> command .)
+    $end            reduce using rule 4 (graph -> command .)
+
+
+state 5
+
+    (5) command -> NODE . EOC
+    (6) command -> NODE . DIR_EDGE NODE EOC
+    (7) command -> NODE . BI_EDGE NODE EOC
+
+    EOC             shift and go to state 8
+    DIR_EDGE        shift and go to state 9
+    BI_EDGE         shift and go to state 10
+
+
+state 6
+
+    (1) grapl -> TITLE EOC . graph
+    (3) graph -> . graph command
+    (4) graph -> . command
+    (5) command -> . NODE EOC
+    (6) command -> . NODE DIR_EDGE NODE EOC
+    (7) command -> . NODE BI_EDGE NODE EOC
+
+    NODE            shift and go to state 5
+
+    graph                          shift and go to state 11
+    command                        shift and go to state 4
+
+state 7
+
+    (3) graph -> graph command .
+
+    NODE            reduce using rule 3 (graph -> graph command .)
+    $end            reduce using rule 3 (graph -> graph command .)
+
+
+state 8
+
+    (5) command -> NODE EOC .
+
+    NODE            reduce using rule 5 (command -> NODE EOC .)
+    $end            reduce using rule 5 (command -> NODE EOC .)
+
+
+state 9
+
+    (6) command -> NODE DIR_EDGE . NODE EOC
+
+    NODE            shift and go to state 12
+
+
+state 10
+
+    (7) command -> NODE BI_EDGE . NODE EOC
+
+    NODE            shift and go to state 13
+
+
+state 11
+
+    (1) grapl -> TITLE EOC graph .
+    (3) graph -> graph . command
+    (5) command -> . NODE EOC
+    (6) command -> . NODE DIR_EDGE NODE EOC
+    (7) command -> . NODE BI_EDGE NODE EOC
+
+    $end            reduce using rule 1 (grapl -> TITLE EOC graph .)
+    NODE            shift and go to state 5
+
+    command                        shift and go to state 7
+
+state 12
+
+    (6) command -> NODE DIR_EDGE NODE . EOC
+
+    EOC             shift and go to state 14
+
+
+state 13
+
+    (7) command -> NODE BI_EDGE NODE . EOC
+
+    EOC             shift and go to state 15
+
+
+state 14
+
+    (6) command -> NODE DIR_EDGE NODE EOC .
+
+    NODE            reduce using rule 6 (command -> NODE DIR_EDGE NODE EOC .)
+    $end            reduce using rule 6 (command -> NODE DIR_EDGE NODE EOC .)
+
+
+state 15
+
+    (7) command -> NODE BI_EDGE NODE EOC .
+
+    NODE            reduce using rule 7 (command -> NODE BI_EDGE NODE EOC .)
+    $end            reduce using rule 7 (command -> NODE BI_EDGE NODE EOC .)
+
