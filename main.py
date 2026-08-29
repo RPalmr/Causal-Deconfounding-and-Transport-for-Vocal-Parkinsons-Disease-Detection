@@ -102,7 +102,7 @@ def ks_p(a, b):
     a, b = a[np.isfinite(a)], b[np.isfinite(b)]
     if len(a) < 3 or len(b) < 3:
         return 1.0
-    return float(ks_2samp(a, b, alternative="greater").pvalue)
+    return float(ks_2samp(a, b, alternative="two-sided").pvalue)
 
 
 def balacc(y, score):
