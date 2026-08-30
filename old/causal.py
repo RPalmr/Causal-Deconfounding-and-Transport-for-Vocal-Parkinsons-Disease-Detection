@@ -33,10 +33,8 @@ GRAPH_MODELS = {
     "updrs": "y;X;Age;UPDRS; y->X; Age->X; Age->y; y->UPDRS; UPDRS->X;",
     "both":  "y;X;Age;UPDRS;GRBAS; y->X; Age->X; Age->y; y->UPDRS; UPDRS->X; "
              "y->GRBAS; GRBAS->X;",
-    "g-as[a]":   "y;X;Age;Sex;GRBAS; y->X; Age->X; Age->y; Sex->X; Sex->y; "
-                 "y->GRBAS; GRBAS->X;",
-    "ug-as[a]":  "y;X;Age;Sex;UPDRS;GRBAS; y->X; Age->X; Age->y; Sex->X; Sex->y; "
-                 "y->UPDRS; UPDRS->X; y->GRBAS; GRBAS->X;",
+    "g-as[a]":   "y;X;Age;Sex; y->X; Age->X; Age->y; Sex->X; Sex->y;",
+    "ug-as[a]":  "y;X;Age;Sex; y->X; Age->X; Age->y; Sex->X; Sex->y;",
     "xy":    "y;X; X->y;",
 }
 INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}
