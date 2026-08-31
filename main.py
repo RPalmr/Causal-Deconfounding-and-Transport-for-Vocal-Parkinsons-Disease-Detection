@@ -183,6 +183,8 @@ def transfer(xfer_reps, cb_repeats):
     import transport_u_duration as tud
 
     Xp, yp, agp, sxp, _, up_p, gr_p = c.load_nv(task="PETACA_BLANCA")
+    up_p = impute_median(up_p, yp)
+    gr_p = impute_median(gr_p, yp)
     intervals = tud.load_pc_intervals()
 
     path = OUT + "/pipeline_transfer.csv"
@@ -317,10 +319,10 @@ def main():
     global RANDOM_SEED
     ap = argparse.ArgumentParser()
     ap.add_argument("--reps", type=int, default=None)
-    ap.add_argument("--pc-reps", type=int, default=50)
-    ap.add_argument("--nv-reps", type=int, default=200)
-    ap.add_argument("--xfer-reps", type=int, default=200)
-    ap.add_argument("--cb-repeats", type=int, default=10)
+    ap.add_argument("--pc-reps", type=int, default=25)
+    ap.add_argument("--nv-reps", type=int, default=100)
+    ap.add_argument("--xfer-reps", type=int, default=100)
+    ap.add_argument("--cb-repeats", type=int, default=5)
     ap.add_argument("--seed", type=int, default=c.RANDOM_SEED)
     args = ap.parse_args()
     RANDOM_SEED = args.seed
