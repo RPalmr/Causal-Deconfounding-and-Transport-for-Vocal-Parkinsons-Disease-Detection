@@ -9,6 +9,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.svm import SVC
+from tqdm import tqdm
 
 import old.causal as c
 
@@ -145,10 +146,10 @@ def nv_weights(graph, X, y, ag, sx, up, gr):
     return weights(graph, X, y, feats)
 
 
-def deconf_game(W, X, y, pid, reps, repeats, variant="weights"):
+def deconf_game(W, X, y, pid, reps, repeats, variant="weights", desc=""):
     X, y, pid = np.asarray(X), np.asarray(y), np.asarray(pid)
     conf, dec = [], []
-    for rep in range(reps):
+    for rep in tqdm(range(reps), desc=desc, leave=False):
         for tr, te in fold_masks(pid, y, RANDOM_SEED + rep):
             seed = RANDOM_SEED + rep
             if variant == "weights":
@@ -189,7 +190,7 @@ def transfer(xfer_reps, cb_repeats):
 
     path = OUT + "/pipeline_transfer.csv"
     rows = []
-    for name, (X_t, y_t, sid_t, t_age, t_sex) in intervals.items():
+    for name, (X_t, y_t, sid_t, t_age, t_sex) in tqdm(intervals.items(), desc="transfer intervals"):
         if done(path, ["interval", "reps", "cb_repeats"],
                 [name, xfer_reps, cb_repeats]):
             continue
@@ -202,7 +203,7 @@ def transfer(xfer_reps, cb_repeats):
         W = np.clip(W, lo, hi)
 
         med = {"conf": [], "dec": []}
-        for rep in range(xfer_reps):
+        for rep in tqdm(range(xfer_reps), desc=f"  interval {name}", leave=False):
             seed = RANDOM_SEED + rep
             gd = c._gbc(Xp, yp, W, seed=seed)
             gc = c._gbc(Xp, yp, seed=seed)
@@ -298,7 +299,8 @@ def quality_arms(path4, rows, Xf, yf, sidf, mq, qv, qcols, pc_reps, cb_repeats):
                 [var, pc_reps, cb_repeats]):
             return
         W = weights(GRAPH_QUALITY, Xf[mq], yf[mq], [("Quality", vals, bins, False)])
-        conf, dec = deconf_game(W, Xf[mq], yf[mq], sidf[mq], pc_reps, cb_repeats)
+        conf, dec = deconf_game(W, Xf[mq], yf[mq], sidf[mq], pc_reps, cb_repeats,
+                                desc=f"PC {var}")
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
         rows.append([var, len(vals), mc, md, md - mc, p, pc_reps, cb_repeats])
@@ -319,10 +321,10 @@ def main():
     global RANDOM_SEED
     ap = argparse.ArgumentParser()
     ap.add_argument("--reps", type=int, default=None)
-    ap.add_argument("--pc-reps", type=int, default=25)
-    ap.add_argument("--nv-reps", type=int, default=100)
-    ap.add_argument("--xfer-reps", type=int, default=100)
-    ap.add_argument("--cb-repeats", type=int, default=5)
+    ap.add_argument("--pc-reps", type=int, default=50)
+    ap.add_argument("--nv-reps", type=int, default=200)
+    ap.add_argument("--xfer-reps", type=int, default=200)
+    ap.add_argument("--cb-repeats", type=int, default=10)
     ap.add_argument("--seed", type=int, default=c.RANDOM_SEED)
     args = ap.parse_args()
     RANDOM_SEED = args.seed
@@ -344,14 +346,16 @@ def main():
 
     path3 = OUT + "/pipeline_variants_nv.csv"
     rows3 = []
-    for graph, variant in (("control", "bootstrap"), ("control", "weights"),
-                           ("ug-as[a]", "bootstrap"), ("ug-as[a]", "weights")):
+    for graph, variant in tqdm([("control", "bootstrap"), ("control", "weights"),
+                                ("ug-as[a]", "bootstrap"), ("ug-as[a]", "weights")],
+                               desc="NV arms"):
         if done(path3, ["graph", "variant", "reps", "cb_repeats"],
                 [graph, variant, args.nv_reps, args.cb_repeats]):
             continue
         gx = GRAPH_CONTROL if graph == "control" else c.GRAPH_MODELS[graph]
         W = nv_weights(gx, X, y, ag, sx, up, gr)
-        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, variant)
+        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, variant,
+                                desc=f"  {graph}/{variant}")
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
         rows3.append([graph, variant, mc, md, md - mc, p,
@@ -367,7 +371,8 @@ def main():
                 [var, args.pc_reps, args.cb_repeats]):
             return
         W = weights(graph, X, y, [(feat, vals, bins, disc)])
-        conf, dec = deconf_game(W, X, y, sid, args.pc_reps, args.cb_repeats)
+        conf, dec = deconf_game(W, X, y, sid, args.pc_reps, args.cb_repeats,
+                                desc=f"PC {var}")
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
         rows4.append([var, len(vals), mc, md, md - mc, p, args.pc_reps, args.cb_repeats])
@@ -436,7 +441,8 @@ def main():
         pass
     else:
         W = nv_weights(c.GRAPH_MODELS["g-as[a]"], X, y, ag, sx, up, gr)
-        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, "bootstrap")
+        conf, dec = deconf_game(W, X, y, pid, args.nv_reps, args.cb_repeats, "bootstrap",
+                                desc="NV g-as[a]")
         mc, md = float(np.median(conf)), float(np.median(dec))
         p = ks_p(dec, conf)
         save(path4b, ["graph"], NV1_COLS,
