@@ -5,7 +5,6 @@ import numpy as np
 import openpyxl
 import pandas as pd
 from scipy.stats import ks_2samp
-from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
@@ -17,7 +16,6 @@ OUT = str(c.BASE) + "/outputs"
 QUALITY_CSV = str(c.BASE) + "/data/parkceleb_extracted/quality_features_parkceleb.csv"
 N_FOLDS = 10
 NV_EXCLUDED = {"0056", "0074", "0121", "0135"}
-TCB_CLIP = (1.0, 99.0)
 RANDOM_SEED = c.RANDOM_SEED
 
 GRAPH_CONTROL = "y;X; y->X;"
@@ -181,35 +179,31 @@ def conf_subsample(X, y, sex, p_m, p_f, seed):
     return np.asarray(X)[i], y[i], sex[i], i
 
 
-def transfer(pc, xfer_reps, cb_repeats):
+def transfer(xfer_reps, cb_repeats):
+    import transport_u_duration as tud
+
     Xp, yp, agp, sxp, _, up_p, gr_p = c.load_nv(task="PETACA_BLANCA")
-    pid_pb = np.arange(len(yp))
-    mu, sd = Xp.mean(0), np.maximum(Xp.std(0), 1e-9)
-    Xs = (Xp - mu) / sd
-    pca = PCA(n_components=2)
-    L = pca.fit_transform(Xs[:, c.INTENSITY_IDX])
-    corrs = np.array([abs(np.corrcoef(L[:, i], yp)[0, 1]) for i in range(2)])
-    ku = np.argsort(corrs)[:c.U_DIMS]
-    Unv = L[:, ku]
+    intervals = tud.load_pc_intervals()
+
     path = OUT + "/pipeline_transfer.csv"
     rows = []
-    for name, (X_pc, y_pc, sid_pc, _) in pc.items():
-        if name == "full":
-            continue
+    for name, (X_t, y_t, sid_t, t_age, t_sex) in intervals.items():
         if done(path, ["interval", "reps", "cb_repeats"],
                 [name, xfer_reps, cb_repeats]):
             continue
-        m0 = ~np.isnan(X_pc).any(axis=1)
-        X_t = (X_pc[m0] - mu) / sd
-        y_t, sid_t = y_pc[m0], sid_pc[m0]
-        Upc = pca.transform(X_t[:, c.INTENSITY_IDX])[:, ku]
-        Wt = np.column_stack([c._tcb_weights(Upc, Unv, yp, clip=TCB_CLIP)] * 2)
+        m0 = ~np.isnan(X_t).any(axis=1)
+        X_t, y_t, sid_t = X_t[m0], y_t[m0], sid_t[m0]
+        t_age, t_sex = t_age[m0], t_sex[m0]
+
+        W = tud.ugas_weights(Xp, yp, agp, sxp, up_p, gr_p, t_age, t_sex)
+        lo, hi = np.percentile(W, 5), np.percentile(W, 95)
+        W = np.clip(W, lo, hi)
+
         med = {"conf": [], "dec": []}
         for rep in range(xfer_reps):
-            Xd, yd, _ = resample(Xs, yp, Wt, pid_pb, cb_repeats,
-                                 seed=RANDOM_SEED + rep)
-            gd = c._gbc(Xd, yd, seed=RANDOM_SEED + rep)
-            gc = c._gbc(Xs, yp, seed=RANDOM_SEED + rep)
+            seed = RANDOM_SEED + rep
+            gd = c._gbc(Xp, yp, W, seed=seed)
+            gc = c._gbc(Xp, yp, seed=seed)
             med["dec"].append(speaker_ba(sid_t, y_t, gd.predict_proba(X_t)[:, 1]))
             med["conf"].append(speaker_ba(sid_t, y_t, gc.predict_proba(X_t)[:, 1]))
         mc, md = float(np.median(med["conf"])), float(np.median(med["dec"]))
@@ -446,7 +440,7 @@ def main():
         save(path4b, ["graph"], NV1_COLS,
              [["g-as[a]", mc, md, md - mc, p, args.nv_reps, args.cb_repeats]])
 
-    transfer(pc, args.xfer_reps, args.cb_repeats)
+    transfer(args.xfer_reps, args.cb_repeats)
 
 if __name__ == "__main__":
     main()
