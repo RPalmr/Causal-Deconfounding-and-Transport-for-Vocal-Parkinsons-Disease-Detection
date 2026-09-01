@@ -1,3 +1,10 @@
+"""neurovoz audio resampler for the dissertation pipeline.
+
+loads every wav under data/neurovoz/audios, force-mono mixes stereo clips,
+resamples any rate outside {8k, 16k, 32k, 48k} to 32 khz pcm_16 via
+scipy resample_poly, and writes the results to data/neurovoz/downsample_audios
+together with a conversion_log.csv used by downstream feature extraction."""
+
 from pathlib import Path
 import numpy as np
 import soundfile as sf

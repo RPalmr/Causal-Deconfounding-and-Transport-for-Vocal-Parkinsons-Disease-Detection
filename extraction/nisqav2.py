@@ -1,3 +1,11 @@
+"""nisqa speech-quality feature extractor for parkceleb in the dissertation.
+
+resolves each row of the parkceleb extraction manifest to a local audio
+file, cuts a centred 30 s 48 khz mono snippet with ffmpeg, runs the nisqa
+pretrained model (mos/noi/dis/col/loud), merges the predictions back to
+the manifest, and writes them incrementally to
+data/parkceleb_extracted/quality_features_parkceleb.csv (resumable)."""
+
 import argparse, os, shutil, subprocess, sys, tempfile
 import numpy as np
 import pandas as pd

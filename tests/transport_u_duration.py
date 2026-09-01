@@ -1,3 +1,10 @@
+"""ugas transport arm used by main.py for the dissertation.
+
+loads neurovoz petaca blanca and parkceleb disease-duration intervals,
+computes per-interval source-side causal-bootstrapping weights from the
+age+sex graph and target-side exact transport ratios, then reports
+balanced accuracy / f1 / auc for confounded and deconfounded arms."""
+
 import sys, os
 import numpy as np
 import pandas as pd
@@ -19,7 +26,7 @@ import transport_u_age as age
 import transport_u_duration as dur
 
 RANDOM_SEED = 42
-N_BOOT = 100
+N_BOOT = 200
 AGE_EDGES = np.arange(40, 101, 10)
 META_COLS = {"Unnamed: 0", "tot_name"}
 INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}

@@ -1,3 +1,9 @@
+"""neurovoz to parkceleb age-transport diagnostic for the dissertation.
+
+trains a neurovoz source classifier and reweights it for each parkceleb
+disease-duration interval using binned and kde age/sex density ratios,
+printing per-interval confounded vs deconfounded balanced accuracy."""
+
 import sys, os, argparse
 import numpy as np
 from scipy.stats import ks_2samp

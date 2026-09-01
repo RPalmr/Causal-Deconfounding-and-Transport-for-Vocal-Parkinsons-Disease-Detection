@@ -1,3 +1,10 @@
+"""grbas rating cleaner for neurovoz in the dissertation pipeline.
+
+reads the raw per-task grbas csvs in data/grbas/, normalises subscore
+columns g/r/b/a/s and total, joins each task against the audio roster
+under data/neurovoz/audios by normalised task stem, and optionally
+back-fills rows for unrated audios; writes one cleaned csv per task."""
+
 import argparse
 import os
 import re

@@ -1,3 +1,9 @@
+"""self-supervised vs hand-crafted feature transfer comparison for the dissertation.
+
+loads neurovoz petaca blanca clips and parkceleb full set with paired
+wav2vec2 embeddings, then reports transfer accuracy/auc under raw and
+causal-bootstrapping arms across multiple pca dimensionalities."""
+
 import sys, os, glob
 import numpy as np
 import pandas as pd

@@ -1,3 +1,10 @@
+"""legacy core module shared by the dissertation pipeline.
+
+exposes the causal graph dictionary, neurovoz and parkceleb corpus loaders,
+the causal-bootstrapping weight routine, the shared gradient-boosted
+classifier factory, and the speaker-level split helper consumed by main.py
+and the tests/ transport arms."""
+
 import sys, os, re
 import numpy as np
 import pandas as pd

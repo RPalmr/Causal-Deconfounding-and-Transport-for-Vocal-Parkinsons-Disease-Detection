@@ -1,3 +1,9 @@
+"""stage-2 raw-feature transport experiment for the dissertation's raw-feature chapter.
+
+trains a neurovoz gradient-boosted classifier with u=age appended and
+evaluates cross-corpus transfer to parkceleb under transported, sID-
+weighted, feature-aligned, placebo, no-u, and age-only variants."""
+
 import sys, os
 import numpy as np
 import pandas as pd

@@ -1,3 +1,10 @@
+"""pca-based speaker-id proxy transport arm for the dissertation.
+
+extracts the most disease-orthogonal pca component of parkceleb intensity
+features as a latent confounder u, then runs the same parkceleb interval
+transfer experiment as main.py using importance-weighted reweighting
+instead of the ugas age+sex graph."""
+
 import argparse
 import os
 
@@ -21,7 +28,8 @@ def done(path, key_cols, vals):
     try:
         d = pd.read_csv(path, dtype=str)
         return (pd.Index(key_cols).isin(d.columns).all()
-                and tuple(map(str, vals)) in set(zip(*[d[k].values for k in key_cols])))
+                and tuple(map(str, vals))
+                in set(zip(*[d[k].values for k in key_cols])))
     except Exception:
         return False
 
@@ -104,7 +112,7 @@ def transfer(xfer_reps, cb_repeats):
     U_nv = L_nv[:, best_k]
 
     intervals = c.load_pc()
-    path = OUT + "/pipeline_transfer_pca.csv"
+    path = OUT + "/pipeline_transfer_sid_proxy.csv"
     rows = []
     for name, payload in tqdm(intervals.items(), desc="transfer intervals"):
         if done(path, ["interval", "reps", "cb_repeats"],
@@ -126,7 +134,11 @@ def transfer(xfer_reps, cb_repeats):
         W = pca_confounder_weights(U_nv, nv_Y, U_pc, y_t)
 
         med = {"conf": [], "dec": []}
-        for rep in tqdm(range(xfer_reps), desc=f"  interval {name}", leave=False):
+        for rep in tqdm(
+            range(xfer_reps),
+            desc=f"  interval {name}",
+            leave=False,
+        ):
             seed = RANDOM_SEED + rep
             gd = c._gbc(Xp, yp, W, seed=seed)
             gc = c._gbc(Xp, yp, seed=seed)
@@ -144,7 +156,7 @@ def transfer(xfer_reps, cb_repeats):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--xfer-reps", type=int, default=200)
-    ap.add_argument("--cb-repeats", type=int, default=10)
+    ap.add_argument("--cb-repeats", type=int, default=200)
     ap.add_argument("--out-dir", type=str, default=None)
     args = ap.parse_args()
     if args.out_dir is not None:

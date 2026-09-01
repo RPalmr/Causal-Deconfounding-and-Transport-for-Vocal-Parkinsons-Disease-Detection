@@ -1,3 +1,9 @@
+"""speaker-level self-supervised control experiment for the dissertation.
+
+compares raw 66-dim acoustic features against wav2vec2 self-supervised
+embeddings as the source representation for neurovoz to parkceleb
+transfer, both with and without causal-bootstrapping reweighting."""
+
 import sys, os
 import numpy as np, pandas as pd
 from xgboost import XGBClassifier

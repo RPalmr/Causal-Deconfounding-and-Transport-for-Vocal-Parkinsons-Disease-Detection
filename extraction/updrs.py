@@ -1,3 +1,10 @@
+"""updrs table builder for neurovoz in the dissertation pipeline.
+
+joins metadata_pd and metadata_hc, zero-pads the patient id to four
+digits, and writes a per-pid table of median updrs scale plus group
+label to data/updrs/updrs.csv; consumed by old.causal._cb for the
+updrs and both back-door graphs."""
+
 import argparse
 from pathlib import Path
 

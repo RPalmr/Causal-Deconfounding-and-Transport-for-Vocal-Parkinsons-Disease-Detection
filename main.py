@@ -1,3 +1,35 @@
+"""top-level pipeline runner for the dissertation experiments.
+
+orchestrates the same-corpus parkceleb arms, the neurovoz graph/variant arms,
+and the cross-corpus transfer to parkceleb intervals, writing incremental
+results to the outputs/ directory used by the dissertation chapters.
+
+the two transport methods invoked from this file are:
+
+  1. ugas (age+sex graph) — see tests/transport_u_duration.py. fits source-
+     side causal-bootstrapping weights from the age+sex back-door graph
+     (y;X;Age;Sex; y->X; Age->X; Age->y; Sex->X; Sex->y;) and multiplies
+     them by an exact laplace-smoothed (age x sex) pmf transport ratio
+     between neurovoz petaca blanca and each parkceleb disease-duration
+     interval, then bootstraps a feature-selected gbm with and without
+     these weights and reports per-interval confounded vs deconfounded
+     balanced accuracy, f1 and auc.
+
+  2. speaker-id proxy — see tests/transport_sid_proxy.py, invoked via the
+     --transport-only flag. reduces parkceleb intensity features to a
+     single pca component most orthogonal to parkinson's label as a latent
+     confounder u, then builds importance weights w = p(u|src) /
+     (p(u|trg) * p(y|src,u)) using a logistic-regression proxy for the
+     latter, and re-runs the same per-interval transfer with the same
+     gbm speaker-balanced-accuracy protocol.
+
+the nv graph/variant arms (control / g-as[a] / ug-as[a] x bootstrap /
+weights) reuse the same _cb weights routine from old.causal but are not
+transport methods — they only test within-corpus deconfounding on
+neurovoz. the pc arms (age, accent, quality, control) are likewise
+within-corpus. transfer() is the only true cross-corpus step in this
+file."""
+
 import argparse
 import os
 import sys
