@@ -184,8 +184,6 @@ def transfer(xfer_reps, cb_repeats):
     import transport_u_duration as tud
 
     Xp, yp, agp, sxp, _, up_p, gr_p = c.load_nv(task="PETACA_BLANCA")
-    up_p = impute_median(up_p, yp)
-    gr_p = impute_median(gr_p, yp)
     intervals = tud.load_pc_intervals()
 
     path = OUT + "/pipeline_transfer.csv"
@@ -198,7 +196,7 @@ def transfer(xfer_reps, cb_repeats):
         X_t, y_t, sid_t = X_t[m0], y_t[m0], sid_t[m0]
         t_age, t_sex = t_age[m0], t_sex[m0]
 
-        W = tud.ugas_weights(Xp, yp, agp, sxp, up_p, gr_p, t_age, t_sex)
+        W = tud.ugas_weights(Xp, yp, agp, sxp, t_age, t_sex)
         lo, hi = np.percentile(W, 5), np.percentile(W, 95)
         W = np.clip(W, lo, hi)
 
@@ -326,11 +324,16 @@ def main():
     ap.add_argument("--xfer-reps", type=int, default=200)
     ap.add_argument("--cb-repeats", type=int, default=10)
     ap.add_argument("--seed", type=int, default=c.RANDOM_SEED)
+    ap.add_argument("--transport-only", action="store_true")
     args = ap.parse_args()
     RANDOM_SEED = args.seed
     if args.reps is not None:
         args.pc_reps = args.nv_reps = args.xfer_reps = args.reps
     os.makedirs(OUT, exist_ok=True)
+
+    if args.transport_only:
+        transfer(args.xfer_reps, args.cb_repeats)
+        return
 
     rep_pc()
     rep_nv()
@@ -432,6 +435,16 @@ def main():
                                 ["quality", args.pc_reps, args.cb_repeats]):
         rows4.append(["quality", 0, np.nan, np.nan, np.nan, np.nan,
                       args.pc_reps, args.cb_repeats])
+
+    if not done(path4, ["variable", "reps", "cb_repeats"],
+                ["control", args.pc_reps, args.cb_repeats]):
+        W_ctrl = np.ones((len(Xf), 2))
+        conf_c, dec_c = deconf_game(W_ctrl, Xf, yf, sidf, args.pc_reps,
+                                    args.cb_repeats, desc="PC control")
+        mc, md = float(np.median(conf_c)), float(np.median(dec_c))
+        rows4.append(["control", len(Xf), mc, md, md - mc, ks_p(dec_c, conf_c),
+                      args.pc_reps, args.cb_repeats])
+
     if rows4:
         save(path4, ["variable"], PC_COLS, rows4)
 
