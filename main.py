@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 import numpy as np
 import openpyxl
@@ -14,6 +15,9 @@ from tqdm import tqdm
 import old.causal as c
 
 OUT = str(c.BASE) + "/outputs"
+if str(c.BASE) + "/tests" not in sys.path:
+    sys.path.insert(0, str(c.BASE) + "/tests")
+import transport_sid_proxy as tsp
 QUALITY_CSV = str(c.BASE) + "/data/parkceleb_extracted/quality_features_parkceleb.csv"
 N_FOLDS = 10
 NV_EXCLUDED = {"0056", "0074", "0121", "0135"}
@@ -332,11 +336,8 @@ def main():
     os.makedirs(OUT, exist_ok=True)
 
     if args.transport_only:
-transfer(args.xfer_reps, args.cb_repeats)
-
-    import transport_sid_proxy as tsp
-    tsp.OUT = OUT
-    tsp.transfer(args.xfer_reps, args.cb_repeats)
+        tsp.OUT = OUT
+        tsp.transfer(args.xfer_reps, args.cb_repeats)
         return
 
     rep_pc()
