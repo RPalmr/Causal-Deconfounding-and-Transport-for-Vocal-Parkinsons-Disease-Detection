@@ -14,7 +14,7 @@ import transport_sid_proxy as tsp
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--xfer-reps", type=int, default=200)
-    ap.add_argument("--cb-repeats", type=int, default=10)
+    ap.add_argument("--cb-repeats", type=int, default=200)
     ap.add_argument("--out-dir", type=str, default=os.path.join(BASE, "results"))
     args = ap.parse_args()
 
