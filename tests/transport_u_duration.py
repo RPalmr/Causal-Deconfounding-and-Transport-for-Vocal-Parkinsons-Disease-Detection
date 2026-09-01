@@ -2,6 +2,7 @@ import sys, os
 import numpy as np
 import pandas as pd
 import openpyxl
+from tqdm import tqdm
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for p in [f"{BASE}/libraries/CausalBootstrapping", f"{BASE}/libraries/GRAPL",
@@ -18,7 +19,7 @@ import transport_u_age as age
 import transport_u_duration as dur
 
 RANDOM_SEED = 42
-N_BOOT = 200
+N_BOOT = 100
 AGE_EDGES = np.arange(40, 101, 10)
 META_COLS = {"Unnamed: 0", "tot_name"}
 INTERVALS = {"-2": (-10, -6), "-1": (-5, -1), "1": (0, 5), "2": (6, 10)}
@@ -30,7 +31,38 @@ GBM_GRID = {"n_estimators": [100, 200], "max_depth": [3, 5],
             "learning_rate": [0.05, 0.1]}
 CB_FIT_METHOD = "kde"
 
-UGAS_GRAPH = "y;X;Age;Sex;UPDRS;GRBAS; y<->X; y->UPDRS; UPDRS->X; y->GRBAS; GRBAS->X; Age->X; Age->y; Sex->X; Sex->y;"
+UGAS_GRAPH = "y;X;Age;Sex; y->X; Age->X; Age->y; Sex->X; Sex->y;"
+
+def _stem(x):
+    s = str(x).rsplit("/", 1)[-1]
+    while s.endswith(".wav"):
+        s = s[:-4]
+    return s.replace("audios-", "").replace("audios/", "")
+
+
+def _sl(df, kv, common, meta_cols):
+    return (df.loc[kv.isin(common)]
+              .loc[:, ~df.columns.isin(meta_cols)]
+              .set_index(kv[kv.isin(common)].values))
+
+
+def balanced_acc(y, prob):
+    y = np.asarray(y).ravel().astype(int)
+    p = (np.asarray(prob).ravel() >= 0.5).astype(int)
+    if len(y) == 0:
+        return float("nan")
+    pos = (y == 1).sum()
+    neg = (y == 0).sum()
+    if pos == 0 or neg == 0:
+        return float("nan")
+    tp = ((y == 1) & (p == 1)).sum()
+    tn = ((y == 0) & (p == 0)).sum()
+    return 0.5 * (tp / pos + tn / neg)
+
+
+def patient_level_metrics(y, proba, pids=None):
+    return patient_metrics(y, proba, pids)
+
 
 def load_nv_petaca():
     hc = pd.read_csv(f"{BASE}/data/neurovoz/metadata/metadata_hc.csv")
@@ -204,7 +236,7 @@ def exact_pmf(names, vals, laplace=0.0):
     exec(f"_pdf = lambda {','.join(names)}: _core({','.join(names)})", ns)
     return ns["_pdf"]
 
-def source_cb_weights(Xsf, ys, ag, sx, up, gr):
+def source_cb_weights(Xsf, ys, ag, sx):
 
     w = ca.causal_weights(
         causal_graph=UGAS_GRAPH, cause_var="y", effect_var="X",
@@ -213,8 +245,6 @@ def source_cb_weights(Xsf, ys, ag, sx, up, gr):
         y=ys,
         Age=(ag, len(AGE_EDGES) - 1),
         Sex=sx,
-        UPDRS=(up, len(UPDRS_EDGES) - 1),
-        GRBAS=(gr, len(GRBAS_EDGES) - 1),
     )
     w = np.asarray(w)
     uy = np.unique(ys)
@@ -238,8 +268,8 @@ def transport_ratio(ag, sx, t_age, t_sex):
     den = p_src(a_src, s_src)
     return num / den
 
-def ugas_weights(Xsf, ys, ag, sx, up, gr, t_age, t_sex):
-    w_source = source_cb_weights(Xsf, ys, ag, sx, up, gr)
+def ugas_weights(Xsf, ys, ag, sx, t_age, t_sex):
+    w_source = source_cb_weights(Xsf, ys, ag, sx)
     r = transport_ratio(ag, sx, t_age, t_sex)
     return w_source * r
 
@@ -247,7 +277,7 @@ def patient_metrics(y, proba, pids):
     del pids
     y = np.asarray(y).ravel()
     p = np.asarray(proba).ravel()
-    ba = dur.balanced_acc(y, p)
+    ba = balanced_acc(y, p)
     f1 = f1_score(y, p > 0.5, zero_division=0)
     auc = roc_auc_score(y, p) if len(np.unique(y)) > 1 else np.nan
     return ba, f1, auc
@@ -281,21 +311,21 @@ def grid_search(Xs, ys, pids, seed=0):
                                         "learning_rate": lr}
     return best
 
-def run_interval(name, Xs, ys, ag, sx, up, gr, pids, Xt, yt, sidt, t_age, t_sex):
+def run_interval(name, Xs, ys, ag, sx, pids, Xt, yt, sidt, t_age, t_sex):
     hp = grid_search(Xs, ys, pids, seed=RANDOM_SEED)
-    print(f"    grid-search best params on source: {hp}")
+    print(f"    grid-search best params on source: {hp}", flush=True)
 
     rng = np.random.RandomState(RANDOM_SEED)
     conf_ba, conf_f1, conf_auc = [], [], []
     dec_ba, dec_f1, dec_auc = [], [], []
     ess_runs = []
-    for r in range(N_BOOT):
+    for r in tqdm(range(N_BOOT), desc=f"    bootstrap {name}", leave=False):
         seed = rng.randint(0, 2**31 - 1)
         cols = select_features(Xs, ys, seed)
         Xsf, Xtf = Xs[:, cols], Xt[:, cols]
 
         mod_conf = gbm(random_state=seed, **hp).fit(Xsf, ys)
-        w = ugas_weights(Xsf, ys, ag, sx, up, gr, t_age, t_sex)
+        w = ugas_weights(Xsf, ys, ag, sx, t_age, t_sex)
         ess_runs.append((w.sum() ** 2) / (w ** 2).sum())
         lo, hi = np.percentile(w, 5), np.percentile(w, 95)
         mod_deconf = gbm(random_state=seed + 1, **hp).fit(
@@ -317,9 +347,7 @@ def main():
     Xs, ys, ag, sx, up, gr, pids = load_nv_petaca()
     print(f"NV Petaca source: {Xs.shape[0]} recordings "
           f"({int(ys.sum())} PD / {len(ys) - int(ys.sum())} HC), "
-          f"age [{ag.min():.0f}-{ag.max():.0f}], sex 1: {int(sx.sum())}, "
-          f"UPDRS [{up.min():.0f}-{up.max():.0f}] (HC imputed 0), "
-          f"GRBAS-G [0-{int(gr.max())}]")
+          f"age [{ag.min():.0f}-{ag.max():.0f}], sex 1: {int(sx.sum())}")
 
     intervals = load_pc_intervals()
     for name, (X, y, s, ta, ts) in intervals.items():
@@ -331,8 +359,8 @@ def main():
     print(f"\n{'int':<4}{'BA conf':>9}{'BA deconf':>10}{'F1 conf':>9}"
           f"{'F1 deconf':>10}{'AUC conf':>9}{'AUC deconf':>10}")
     results = {}
-    for name, (X, y, s, ta, ts) in intervals.items():
-        r = run_interval(name, Xs, ys, ag, sx, up, gr, pids, X, y, s, ta, ts)
+    for name, (X, y, s, ta, ts) in tqdm(list(intervals.items()), desc="intervals"):
+        r = run_interval(name, Xs, ys, ag, sx, pids, X, y, s, ta, ts)
         results[name] = r
         print(f"{name:<4}{r['BA conf']:>9.4f}{r['BA deconf']:>10.4f}"
               f"{r['F1 conf']:>9.4f}{r['F1 deconf']:>10.4f}"
