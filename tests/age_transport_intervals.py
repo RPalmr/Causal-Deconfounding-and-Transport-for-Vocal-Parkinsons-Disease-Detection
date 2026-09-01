@@ -85,7 +85,7 @@ def _ks_dec_gt_conf(dec, conf):
     conf = np.asarray(conf, dtype=float)[np.isfinite(conf)]
     if len(dec) < 3 or len(conf) < 3:
         return 1.0
-    return float(ks_2samp(dec, conf, alternative="less").pvalue)
+    return float(ks_2samp(dec, conf, alternative="two-sided").pvalue)
 
 def run2(sX, sy, sage, ssx, label):
     mu_s, sd_s = sX.mean(0), np.maximum(sX.std(0), 1e-9)
