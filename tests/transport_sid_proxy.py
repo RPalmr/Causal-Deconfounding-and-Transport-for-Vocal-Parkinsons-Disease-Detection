@@ -156,7 +156,7 @@ def transfer(xfer_reps, cb_repeats):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--xfer-reps", type=int, default=200)
-    ap.add_argument("--cb-repeats", type=int, default=200)
+    ap.add_argument("--cb-repeats", type=int, default=10)
     ap.add_argument("--out-dir", type=str, default=None)
     args = ap.parse_args()
     if args.out_dir is not None:

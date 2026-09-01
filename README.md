@@ -139,7 +139,7 @@ python main.py
 ```
 
 the default run executes all five arm groups above with `--pc-reps 50`,
-`--nv-reps 200`, `--xfer-reps 200`, `--cb-repeats 200`, and the seed
+`--nv-reps 200`, `--xfer-reps 200`, `--cb-repeats 10`, and the seed
 defined in `old/causal.py` (42). results are appended to the csvs in
 `results/`, deduplicated by their key columns, so re-running with
 different `--reps` only fills the missing rows.
@@ -150,7 +150,7 @@ different `--reps` only fills the missing rows.
 --pc-reps INT      parkceleb repetitions (default 50)
 --nv-reps INT      neurovoz repetitions (default 200)
 --xfer-reps INT    transfer repetitions (default 200)
---cb-repeats INT   bootstrap repeats (default 200)
+--cb-repeats INT   bootstrap repeats (default 10)
 --reps INT         sets pc-reps, nv-reps, xfer-reps to one value
 --seed INT         random seed (default 42, taken from old/causal.py)
 --transport-only   skip everything except tests/transport_sid_proxy.py

@@ -358,7 +358,7 @@ def main():
     ap.add_argument("--pc-reps", type=int, default=50)
     ap.add_argument("--nv-reps", type=int, default=200)
     ap.add_argument("--xfer-reps", type=int, default=200)
-    ap.add_argument("--cb-repeats", type=int, default=200)
+    ap.add_argument("--cb-repeats", type=int, default=10)
     ap.add_argument("--seed", type=int, default=c.RANDOM_SEED)
     ap.add_argument("--transport-only", action="store_true")
     args = ap.parse_args()
