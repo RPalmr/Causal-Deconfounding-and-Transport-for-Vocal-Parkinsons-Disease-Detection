@@ -8,30 +8,6 @@ adjustment on neurovoz, same-corpus deconfounding on parkceleb, and
 cross-corpus transport from neurovoz to parkceleb disease-duration
 intervals.
 
-## data
-
-all input data lives under `data/` and is checked in.
-
-- `data/neurovoz/` — spanish pd corpus (n ≈ 100 patients, petaca blanca
-  elicitation + sustained vowels). subfolders: `metadata/`
-  (`metadata_hc.csv`, `metadata_pd.csv` with id, age, sex, updrs),
-  `extracted_features/` (intensity, pause, syllable csvs per clip),
-  `clean_data_featurized/` (precomputed speaker-aggregated features for
-  the replication arm).
-- `data/ParkCeleb/` — favaro et al. 2024 longitudinal celebrity
-  recordings. `PD_demo.xlsx` and `CN_demo.xlsx` carry year of
-  diagnosis / nationality / ethnicity; `speakers_pairs.xlsx` maps the
-  paired-control speakers. raw audio is not checked in and is pulled
-  from the upstream repo at `extraction/parkceleb/`.
-- `data/parkceleb_extracted/` — derived feature tables consumed by
-  `old/causal.py` and `main.py`: `intensity_`, `pause_`, `syllable_`,
-  and `quality_features_parkceleb.csv` (the last from `extraction/nisqav2.py`).
-  `parkceleb_ages.csv` carries per-clip speaker age, and
-  `parkceleb_upload_years.csv` the youtube upload year used to derive
-  the disease-duration intervals `-2`, `-1`, `1`, `2`.
-- `data/grbas/` — per-task csvs with g/r/b/a/s/total ratings; cleaned
-  in place by `extraction/grbas.py`.
-
 ## layout
 
 ```
