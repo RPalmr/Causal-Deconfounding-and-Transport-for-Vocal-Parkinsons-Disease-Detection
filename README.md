@@ -191,4 +191,4 @@ to regenerate `Dissertation.pdf`; figures are pulled from
 
   ## information
 
-  -project received a distinction
+  - project received a distinction
