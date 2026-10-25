@@ -1,13 +1,5 @@
 # causal-inference-pd
 
-code, data, and figure scripts supporting
-[`Palmer-RXP528`](Palmer-RXP528). the repository contains the full
-experimental pipeline backing the dissertation: causal-bootstrapping
-reweighting of a gradient-boosted pd classifier, age/sex back-door
-adjustment on neurovoz, same-corpus deconfounding on parkceleb, and
-cross-corpus transport from neurovoz to parkceleb disease-duration
-intervals.
-
 ## layout
 
 ```
