@@ -188,3 +188,7 @@ to regenerate `Dissertation.pdf`; figures are pulled from
   for traceability against the bareinboim & correa 2020 algorithm.
 - `tests/` — each script is a self-contained arm and prints a summary
   table at the end. some of them also write notes to `notes/`.
+
+  ## information
+
+  -project received a distinction
